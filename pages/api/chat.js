@@ -1,23 +1,19 @@
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
-import { Pool } from 'pg';
+import { sql } from '@vercel/postgres';
 
-// Initialize OpenAI client
+// Set the runtime to the Vercel Edge for optimal performance
+export const config = {
+  runtime: 'edge',
+};
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Initialize PostgreSQL connection pool
-const pool = new Pool({
-  connectionString: process.env.POSTGRES_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
-});
-
-export default async function handler(req, res) {
+export default async function handler(req) {
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+    return new Response('Method Not Allowed', { status: 405 });
   }
 
   try {
@@ -31,25 +27,19 @@ export default async function handler(req, res) {
     });
     const queryEmbedding = embeddingResponse.data[0].embedding;
 
-    // 2. Query the database for the most relevant document chunks
-    const client = await pool.connect();
-    let contextText = '';
-    try {
-      // Use the pgvector cosine distance operator '<=>' to find the top 5 most similar documents
-      const { rows } = await client.query(
-        'SELECT content FROM documents ORDER BY embedding <=> $1 LIMIT 5',
-        [JSON.stringify(queryEmbedding)]
-      );
-      contextText = rows.map(r => r.content).join('\n\n---\n\n');
-    } finally {
-      client.release();
-    }
+    // 2. Query the Vercel Postgres database using the Edge-compatible driver
+    const { rows } = await sql`
+      SELECT content 
+      FROM documents 
+      ORDER BY embedding <=> ${JSON.stringify(queryEmbedding)} 
+      LIMIT 5
+    `;
+    const contextText = rows.map(r => r.content).join('\n\n---\n\n');
 
     const prompt = `
       You are a highly intelligent AI assistant for U.S. immigration questions.
       Answer the user's question based ONLY on the provided context below.
-      The context contains excerpts from the USCIS Policy Manual and other official sources.
-      If the context does not contain enough information to answer the question, state that you cannot find the information in the provided documents.
+      If the context does not contain enough information, state that you cannot find the information in the provided documents.
       Do not provide legal advice.
 
       Context: """
@@ -61,7 +51,7 @@ export default async function handler(req, res) {
       Answer:
     `;
 
-    // 3. Call the OpenAI Chat API to generate the final response
+    // 3. Call OpenAI to generate the final, streamed response
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       stream: true,
@@ -70,12 +60,10 @@ export default async function handler(req, res) {
     });
 
     const stream = OpenAIStream(response);
-
-    // Pipe the stream to the response for the Node.js runtime
-    stream.pipe(res);
+    return new StreamingTextResponse(stream);
 
   } catch (error) {
     console.error('Error in chat API:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
+    return new Response('Internal Server Error', { status: 500 });
   }
 }
