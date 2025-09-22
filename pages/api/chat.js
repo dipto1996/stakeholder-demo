@@ -35,19 +35,26 @@ export default async function handler(req, res) {
         'SELECT content FROM documents ORDER BY embedding <=> $1 LIMIT 5',
         [JSON.stringify(queryEmbedding)]
       );
-      contextText = rows.map(r => r.content).join('\n\n---\n\n');
+      contextText = rows.map(r => r.content).join('\\n\\n---\\n\\n');
     } finally {
       client.release();
     }
 
-    const prompt = \`
-      You are a highly intelligent AI assistant...
+    const prompt = `
+      You are a highly intelligent AI assistant for U.S. immigration questions.
+      Answer the user's question based ONLY on the provided context below.
+      The context contains excerpts from the USCIS Policy Manual and other official sources.
+      If the context does not contain enough information to answer the question, state that you cannot find the information in the provided documents.
+      Do not provide legal advice.
+
       Context: """
       ${contextText}
       """
+
       User Question: "${userQuery}"
+
       Answer:
-    \`;
+    `;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -57,10 +64,21 @@ export default async function handler(req, res) {
     });
 
     const stream = OpenAIStream(response);
-    stream.pipe(res);
+    // Use the appropriate streaming method for the environment
+    if (res && typeof res.writeHead === 'function') {
+       // For Node.js runtime
+       stream.pipe(res);
+    } else {
+       // For Edge runtime (though we are not using it here, this is good practice)
+       return new StreamingTextResponse(stream);
+    }
 
   } catch (error) {
     console.error('Error in chat API:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
+    if (res && typeof res.status === 'function') {
+        res.status(500).json({ error: 'Internal Server Error' });
+    } else {
+        return new Response('Internal Server Error', { status: 500 });
+    }
   }
 }
