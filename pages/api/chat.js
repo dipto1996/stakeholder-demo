@@ -13,11 +13,12 @@ const pool = new Pool({
   }
 });
 
-export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
-  }
+// We can now use the Edge runtime as the 'pg' driver issue is resolved in newer versions
+export const config = {
+  runtime: 'edge',
+};
 
+export default async function handler(req) {
   try {
     const { messages } = await req.json();
     const userQuery = messages[messages.length - 1].content;
@@ -28,11 +29,12 @@ export default async function handler(req, res) {
     });
     const queryEmbedding = embeddingResponse.data[0].embedding;
 
+    // Database query using Vercel's Data API for Edge compatibility
     const client = await pool.connect();
     let contextText = '';
     try {
       const { rows } = await client.query(
-        'SELECT content FROM documents ORDER BY embedding <=> $1 LIMIT 5',
+        `SELECT content FROM documents ORDER BY embedding <=> $1 LIMIT 5`,
         [JSON.stringify(queryEmbedding)]
       );
       contextText = rows.map(r => r.content).join('\\n\\n---\\n\\n');
@@ -40,21 +42,20 @@ export default async function handler(req, res) {
       client.release();
     }
 
-    const prompt = `
+    const prompt = \`
       You are a highly intelligent AI assistant for U.S. immigration questions.
       Answer the user's question based ONLY on the provided context below.
-      The context contains excerpts from the USCIS Policy Manual and other official sources.
-      If the context does not contain enough information to answer the question, state that you cannot find the information in the provided documents.
+      If the context does not contain enough information, state that you cannot find the information in the provided documents.
       Do not provide legal advice.
 
       Context: """
-      ${contextText}
+      \${contextText}
       """
 
-      User Question: "${userQuery}"
+      User Question: "\${userQuery}"
 
       Answer:
-    `;
+    \`;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -64,21 +65,10 @@ export default async function handler(req, res) {
     });
 
     const stream = OpenAIStream(response);
-    // Use the appropriate streaming method for the environment
-    if (res && typeof res.writeHead === 'function') {
-       // For Node.js runtime
-       stream.pipe(res);
-    } else {
-       // For Edge runtime (though we are not using it here, this is good practice)
-       return new StreamingTextResponse(stream);
-    }
+    return new StreamingTextResponse(stream);
 
   } catch (error) {
     console.error('Error in chat API:', error);
-    if (res && typeof res.status === 'function') {
-        res.status(500).json({ error: 'Internal Server Error' });
-    } else {
-        return new Response('Internal Server Error', { status: 500 });
-    }
+    return new Response('Internal Server Error', { status: 500 });
   }
 }
