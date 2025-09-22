@@ -1,16 +1,14 @@
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
-import { Pool } from 'pg';
+import { sql } from '@vercel/postgres';
+
+// This is the critical missing line that tells Vercel to use the correct environment
+export const config = {
+  runtime: 'edge',
+};
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
-});
-
-const pool = new Pool({
-  connectionString: process.env.POSTGRES_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
 });
 
 export default async function handler(req) {
@@ -19,7 +17,7 @@ export default async function handler(req) {
   }
 
   try {
-    const { messages } = await req.json();
+    const { messages } = await req.json(); // This command now works correctly in the Edge runtime
     const userQuery = messages[messages.length - 1].content;
 
     const embeddingResponse = await openai.embeddings.create({
@@ -28,22 +26,17 @@ export default async function handler(req) {
     });
     const queryEmbedding = embeddingResponse.data[0].embedding;
 
-    const client = await pool.connect();
-    let contextText = '';
-    try {
-      const { rows } = await client.query(
-        'SELECT content FROM documents ORDER BY embedding <=> $1 LIMIT 5',
-        [JSON.stringify(queryEmbedding)]
-      );
-      contextText = rows.map(r => r.content).join('\n\n---\n\n');
-    } finally {
-      client.release();
-    }
+    const { rows } = await sql`
+      SELECT content 
+      FROM documents 
+      ORDER BY embedding <=> ${JSON.stringify(queryEmbedding)} 
+      LIMIT 5
+    `;
+    const contextText = rows.map(r => r.content).join('\n\n---\n\n');
 
     const prompt = `
       You are a highly intelligent AI assistant for U.S. immigration questions.
       Answer the user's question based ONLY on the provided context below.
-      The context contains excerpts from the USCIS Policy Manual and other official sources.
       If the context does not contain enough information, state that you cannot find the information in the provided documents.
       Do not provide legal advice.
 
