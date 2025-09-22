@@ -40,4 +40,39 @@ export default async function handler(req, res) {
       client.release();
     }
 
-    const prompt = `You are a highly intelligent AI assistant for U.S. immigration questions.
+    // Using simple string concatenation to build the prompt for 100% reliability
+    let prompt = "You are a highly intelligent AI assistant for U.S. immigration questions.\n";
+    prompt += "Answer the user's question based ONLY on the provided context below.\n";
+    prompt += "The context contains excerpts from the USCIS Policy Manual and other official sources.\n";
+    prompt += "If the context does not contain enough information to answer the question, state that you cannot find the information in the provided documents.\n";
+    prompt += "Do not provide legal advice.\n\n";
+    prompt += 'Context: """\n';
+    prompt += contextText;
+    prompt += '\n"""\n\n';
+    prompt += `User Question: "${userQuery}"\n\n`;
+    prompt += "Answer:";
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      stream: true,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.1,
+    });
+
+    const stream = OpenAIStream(response);
+
+    // This handles streaming in a standard Node.js environment
+    if (res && typeof res.writeHead === 'function') {
+       stream.pipe(res);
+    } else {
+       return new StreamingTextResponse(stream);
+    }
+  } catch (error) {
+    console.error('Error in chat API:', error);
+    if (res && typeof res.status === 'function') {
+        res.status(500).json({ error: 'Internal Server Error' });
+    } else {
+        return new Response('Internal Server Error', { status: 500 });
+    }
+  }
+}
