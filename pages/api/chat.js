@@ -13,15 +13,16 @@ const pool = new Pool({
   }
 });
 
-export default async function handler(req, res) {
+// We do not need the Edge runtime for this to work
+// export const config = { runtime: 'edge' };
+
+export default async function handler(req) {
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+    return new Response('Method Not Allowed', { status: 405 });
   }
 
   try {
-    // THIS IS THE CORRECTED LINE:
-    const { messages } = req.body;
-
+    const { messages } = await req.json();
     const userQuery = messages[messages.length - 1].content;
 
     const embeddingResponse = await openai.embeddings.create({
@@ -66,10 +67,12 @@ export default async function handler(req, res) {
     });
 
     const stream = OpenAIStream(response);
-    stream.pipe(res);
+
+    // This is the modern, correct way to return a stream
+    return new StreamingTextResponse(stream);
 
   } catch (error) {
     console.error('Error in chat API:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
+    return new Response(`Error: ${error.message}`, { status: 500 });
   }
 }
