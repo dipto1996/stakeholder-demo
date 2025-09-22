@@ -2,7 +2,6 @@ import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
 import { sql } from '@vercel/postgres';
 
-// This is the critical missing line that tells Vercel to use the correct environment
 export const config = {
   runtime: 'edge',
 };
@@ -17,7 +16,7 @@ export default async function handler(req) {
   }
 
   try {
-    const { messages } = await req.json(); // This command now works correctly in the Edge runtime
+    const { messages } = await req.json();
     const userQuery = messages[messages.length - 1].content;
 
     const embeddingResponse = await openai.embeddings.create({
@@ -61,6 +60,6 @@ export default async function handler(req) {
 
   } catch (error) {
     console.error('Error in chat API:', error);
-    return new Response('Internal Server Error', { status: 500 });
+    return new Response(error.message || 'Internal Server Error', { status: 500 });
   }
 }
