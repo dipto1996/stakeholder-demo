@@ -19,7 +19,9 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { messages } = await req.json();
+    // THIS IS THE CORRECTED LINE:
+    const { messages } = req.body;
+
     const userQuery = messages[messages.length - 1].content;
 
     const embeddingResponse = await openai.embeddings.create({
