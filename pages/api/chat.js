@@ -19,8 +19,8 @@ export default async function handler(req) {
     const userQuery = messages[messages.length - 1].content;
 
     const contextText = `
-      H-1B Proclamation of Sep 19, 2025: A $100,000 fee is required.
-      F-1 Student OPT Rules: Students must carry their EAD card and I-20.
+      H-1B Proclamation of Sep 19, 2025: A $100,000 fee is required for certain H-1B beneficiaries.
+      F-1 Student OPT Rules: When traveling on OPT, students must carry their EAD card and their I-20 endorsed for travel by their DSO within the last six months.
     `;
 
     // Using simple string concatenation for 100% reliability
@@ -33,3 +33,15 @@ export default async function handler(req) {
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
+      stream: true,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const stream = OpenAIStream(response);
+    return new StreamingTextResponse(stream);
+
+  } catch (error) {
+    console.error('Error in chat API:', error);
+    return new Response('Internal Server Error', { status: 500 });
+  }
+}
