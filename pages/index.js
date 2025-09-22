@@ -1,49 +1,15 @@
-import { useState, useRef, useEffect } from 'react';
+import { useChat } from 'ai/react';
+import { useRef, useEffect } from 'react';
 
 export default function ChatPage() {
-  const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
+  const { messages, input, handleInputChange, handleSubmit, isLoading } = useChat({
+    api: '/api/chat'
+  });
   const messagesEndRef = useRef(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
-
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!input.trim() || isLoading) return;
-
-    const userMessage = { role: 'user', content: input };
-    const newMessages = [...messages, userMessage];
-    setMessages(newMessages);
-    setInput('');
-    setIsLoading(true);
-
-    try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: newMessages }),
-      });
-
-      if (!response.ok) throw new Error('Network response was not ok.');
-
-      const data = await response.json();
-      const assistantMessage = {
-        role: 'assistant',
-        content: data.answer || "I couldn't find a specific answer.",
-      };
-      setMessages(prev => [...prev, assistantMessage]);
-
-    } catch (error) {
-      console.error("Failed to get a response:", error);
-      const errorMessage = { role: 'assistant', content: "Sorry, I encountered an error. Please try again." };
-      setMessages(prev => [...prev, errorMessage]);
-    } finally {
-      setIsLoading(false);
-    }
-  };
 
   return (
     <div className="flex flex-col h-screen bg-neutral-50 font-sans">
@@ -54,8 +20,8 @@ export default function ChatPage() {
 
       <main className="flex-1 overflow-y-auto p-4">
         <div className="space-y-4 max-w-3xl mx-auto">
-          {messages.map((msg, index) => (
-            <div key={index} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
+          {messages.map((msg) => (
+            <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
               <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
                 <p className="whitespace-pre-wrap text-sm">{msg.content}</p>
               </div>
@@ -71,7 +37,7 @@ export default function ChatPage() {
             <div className="flex space-x-2">
               <input
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
+                onChange={handleInputChange}
                 placeholder="Ask a question about U.S. immigration..."
                 className="flex-1 p-2 border border-neutral-200 rounded-md focus:ring-2 focus:ring-brand-blue focus:outline-none"
                 disabled={isLoading}
