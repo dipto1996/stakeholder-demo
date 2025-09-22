@@ -1,3 +1,4 @@
+import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
 import { Pool } from 'pg';
 
@@ -12,13 +13,13 @@ const pool = new Pool({
   }
 });
 
-export default async function handler(req, res) {
+export default async function handler(req) {
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+    return new Response('Method Not Allowed', { status: 405 });
   }
 
   try {
-    const { messages } = req.body;
+    const { messages } = await req.json();
     const userQuery = messages[messages.length - 1].content;
 
     const embeddingResponse = await openai.embeddings.create({
@@ -42,6 +43,9 @@ export default async function handler(req, res) {
     const prompt = `
       You are a highly intelligent AI assistant for U.S. immigration questions.
       Answer the user's question based ONLY on the provided context below.
+      The context contains excerpts from the USCIS Policy Manual and other official sources.
+      If the context does not contain enough information, state that you cannot find the information in the provided documents.
+      Do not provide legal advice.
 
       Context: """
       ${contextText}
@@ -52,19 +56,18 @@ export default async function handler(req, res) {
       Answer:
     `;
 
-    // We are NOT streaming for this test
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      stream: false, // Streaming is turned off
+      stream: true,
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.1,
     });
 
-    const answer = response.choices[0].message.content;
-    return res.status(200).json({ answer });
+    const stream = OpenAIStream(response);
+    return new StreamingTextResponse(stream);
 
   } catch (error) {
     console.error('Error in chat API:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
+    return new Response('Internal Server Error', { status: 500 });
   }
 }
