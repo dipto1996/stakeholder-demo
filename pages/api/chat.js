@@ -1,4 +1,3 @@
-import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
 import { Pool } from 'pg';
 
@@ -40,27 +39,29 @@ export default async function handler(req, res) {
       client.release();
     }
 
-    // Using robust string concatenation to prevent build errors
-    let prompt = "You are a highly intelligent AI assistant for U.S. immigration questions.\n";
-    prompt += "Answer the user's question based ONLY on the provided context below.\n";
-    prompt += "The context contains excerpts from the USCIS Policy Manual and other official sources.\n";
-    prompt += "If the context does not contain enough information to answer the question, state that you cannot find the information in the provided documents.\n";
-    prompt += "Do not provide legal advice.\n\n";
-    prompt += 'Context: """\n';
-    prompt += contextText;
-    prompt += '\n"""\n\n';
-    prompt += `User Question: "${userQuery}"\n\n`;
-    prompt += "Answer:";
+    const prompt = `
+      You are a highly intelligent AI assistant for U.S. immigration questions.
+      Answer the user's question based ONLY on the provided context below.
 
+      Context: """
+      ${contextText}
+      """
+
+      User Question: "${userQuery}"
+
+      Answer:
+    `;
+
+    // We are NOT streaming for this test
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      stream: true,
+      stream: false, // Streaming is turned off
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.1,
     });
 
-    const stream = OpenAIStream(response);
-    stream.pipe(res);
+    const answer = response.choices[0].message.content;
+    return res.status(200).json({ answer });
 
   } catch (error) {
     console.error('Error in chat API:', error);
