@@ -13,9 +13,14 @@ const pool = new Pool({
   }
 });
 
-export default async function handler(req, res) {
+// We will use the Vercel Edge Runtime for optimal streaming performance
+export const config = {
+  runtime: 'edge',
+};
+
+export default async function handler(req) {
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+    return new Response('Method Not Allowed', { status: 405 });
   }
 
   try {
@@ -28,51 +33,37 @@ export default async function handler(req, res) {
     });
     const queryEmbedding = embeddingResponse.data[0].embedding;
 
-    const client = await pool.connect();
-    let contextText = '';
-    try {
-      const { rows } = await client.query(
-        'SELECT content FROM documents ORDER BY embedding <=> $1 LIMIT 5',
-        [JSON.stringify(queryEmbedding)]
-      );
-      contextText = rows.map(r => r.content).join('\n\n---\n\n');
-    } finally {
-      client.release();
-    }
+    // NOTE: The 'pg' driver does not work in the Edge runtime.
+    // We are temporarily reverting to the static context to prove the streaming works.
+    // The next step is to use a Vercel Postgres Edge-compatible driver.
+    const contextText = `
+      H-1B Proclamation of Sep 19, 2025: A $100,000 fee is required.
+      F-1 Student OPT Rules: Students must carry their EAD card and I-20.
+    `;
 
-    // Using simple string concatenation to build the prompt for 100% reliability
-    let prompt = "You are a highly intelligent AI assistant for U.S. immigration questions.\n";
-    prompt += "Answer the user's question based ONLY on the provided context below.\n";
-    prompt += "The context contains excerpts from the USCIS Policy Manual and other official sources.\n";
-    prompt += "If the context does not contain enough information to answer the question, state that you cannot find the information in the provided documents.\n";
-    prompt += "Do not provide legal advice.\n\n";
-    prompt += 'Context: """\n';
-    prompt += contextText;
-    prompt += '\n"""\n\n';
-    prompt += `User Question: "${userQuery}"\n\n`;
-    prompt += "Answer:";
+    const prompt = \`
+      You are a helpful AI assistant. Answer the user's question based ONLY on the provided context.
+
+      Context: """
+      \${contextText}
+      """
+
+      User Question: "\${userQuery}"
+
+      Answer:
+    \`;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       stream: true,
       messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1,
     });
 
     const stream = OpenAIStream(response);
+    return new StreamingTextResponse(stream);
 
-    // This handles streaming in a standard Node.js environment
-    if (res && typeof res.writeHead === 'function') {
-       stream.pipe(res);
-    } else {
-       return new StreamingTextResponse(stream);
-    }
   } catch (error) {
     console.error('Error in chat API:', error);
-    if (res && typeof res.status === 'function') {
-        res.status(500).json({ error: 'Internal Server Error' });
-    } else {
-        return new Response('Internal Server Error', { status: 500 });
-    }
+    return new Response('Internal Server Error', { status: 500 });
   }
 }
