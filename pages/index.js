@@ -1,4 +1,5 @@
-// This is the final, complete code for pages/index.js
+// This is the final, corrected code for pages/index.js
+// It adds e.preventDefault() to fix the page reload bug.
 import { useState, useRef, useEffect } from 'react';
 import { useChat } from 'ai/react';
 
@@ -17,7 +18,6 @@ export default function ChatPage() {
     "Does USCIS approval guarantee entry?",
   ];
 
-  // Fetch trending topics when the component loads
   useEffect(() => {
     fetch('/trending.json')
       .then(res => res.json())
@@ -25,18 +25,18 @@ export default function ChatPage() {
       .catch(err => console.error("Failed to fetch trending topics:", err));
   }, []);
 
-  // Scroll to the bottom of the chat when new messages appear
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
   const handlePromptClick = (prompt) => {
-    setInput(prompt); // Set the input field with the prompt text
+    setInput(prompt);
     setShowCarousel(false);
   };
 
-  // When the form is submitted, hide the carousel
+  // This function now explicitly prevents the page from reloading
   const handleFormSubmit = (e) => {
+    e.preventDefault(); // This is the critical fix
     setShowCarousel(false);
     handleSubmit(e);
   }
