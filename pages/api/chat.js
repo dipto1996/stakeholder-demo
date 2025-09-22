@@ -19,9 +19,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    // This is the corrected line for the Node.js runtime
     const { messages } = req.body;
-
     const userQuery = messages[messages.length - 1].content;
 
     const embeddingResponse = await openai.embeddings.create({
@@ -42,21 +40,17 @@ export default async function handler(req, res) {
       client.release();
     }
 
-    const prompt = \`
-      You are a highly intelligent AI assistant for U.S. immigration questions.
-      Answer the user's question based ONLY on the provided context below.
-      The context contains excerpts from the USCIS Policy Manual and other official sources.
-      If the context does not contain enough information to answer the question, state that you cannot find the information in the provided documents.
-      Do not provide legal advice.
-
-      Context: """
-      \${contextText}
-      """
-
-      User Question: "\${userQuery}"
-
-      Answer:
-    \`;
+    // Using robust string concatenation to prevent build errors
+    let prompt = "You are a highly intelligent AI assistant for U.S. immigration questions.\n";
+    prompt += "Answer the user's question based ONLY on the provided context below.\n";
+    prompt += "The context contains excerpts from the USCIS Policy Manual and other official sources.\n";
+    prompt += "If the context does not contain enough information to answer the question, state that you cannot find the information in the provided documents.\n";
+    prompt += "Do not provide legal advice.\n\n";
+    prompt += 'Context: """\n';
+    prompt += contextText;
+    prompt += '\n"""\n\n';
+    prompt += `User Question: "${userQuery}"\n\n`;
+    prompt += "Answer:";
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
