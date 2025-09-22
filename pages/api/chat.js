@@ -1,19 +1,10 @@
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
-import { Pool } from 'pg';
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-const pool = new Pool({
-  connectionString: process.env.POSTGRES_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
-});
-
-// We will use the Vercel Edge Runtime for optimal streaming performance
 export const config = {
   runtime: 'edge',
 };
@@ -27,31 +18,20 @@ export default async function handler(req) {
     const { messages } = await req.json();
     const userQuery = messages[messages.length - 1].content;
 
-    const embeddingResponse = await openai.embeddings.create({
-      model: 'text-embedding-3-small',
-      input: userQuery,
-    });
-    const queryEmbedding = embeddingResponse.data[0].embedding;
-
-    // NOTE: The 'pg' driver does not work in the Edge runtime.
-    // We are temporarily reverting to the static context to prove the streaming works.
-    // The next step is to use a Vercel Postgres Edge-compatible driver.
     const contextText = `
       H-1B Proclamation of Sep 19, 2025: A $100,000 fee is required.
       F-1 Student OPT Rules: Students must carry their EAD card and I-20.
     `;
 
-    const prompt = \`
-      You are a helpful AI assistant. Answer the user's question based ONLY on the provided context.
+    const prompt = `You are a helpful AI assistant. Answer the user's question based ONLY on the provided context.
+          
+Context: """
+${contextText}
+"""
 
-      Context: """
-      \${contextText}
-      """
+User Question: "${userQuery}"
 
-      User Question: "\${userQuery}"
-
-      Answer:
-    \`;
+Answer:`;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
