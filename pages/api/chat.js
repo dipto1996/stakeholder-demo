@@ -1,7 +1,5 @@
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
-// We are temporarily not using the database for this test
-// import { sql } from '@vercel/postgres';
 
 export const config = {
   runtime: 'edge',
@@ -29,17 +27,15 @@ export default async function handler(req) {
     `;
     // --- END OF DIAGNOSTIC STEP ---
 
-    const prompt = \`
-      You are a helpful AI assistant. Answer the user's question based ONLY on the provided context.
+    const prompt = \`You are a helpful AI assistant. Answer the user's question based ONLY on the provided context.
+      
+Context: """
+\${contextText}
+"""
 
-      Context: """
-      \${contextText}
-      """
+User Question: "\${userQuery}"
 
-      User Question: "\${userQuery}"
-
-      Answer:
-    \`;
+Answer:\`;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
