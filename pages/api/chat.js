@@ -1,8 +1,8 @@
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
-import { sql } from '@vercel/postgres';
+// We are temporarily not using the database for this test
+// import { sql } from '@vercel/postgres';
 
-// Set the runtime to the Vercel Edge for optimal performance
 export const config = {
   runtime: 'edge',
 };
@@ -20,43 +20,31 @@ export default async function handler(req) {
     const { messages } = await req.json();
     const userQuery = messages[messages.length - 1].content;
 
-    // 1. Create an embedding for the user's query
-    const embeddingResponse = await openai.embeddings.create({
-      model: 'text-embedding-3-small',
-      input: userQuery,
-    });
-    const queryEmbedding = embeddingResponse.data[0].embedding;
-
-    // 2. Query the Vercel Postgres database using the Edge-compatible driver
-    const { rows } = await sql`
-      SELECT content 
-      FROM documents 
-      ORDER BY embedding <=> ${JSON.stringify(queryEmbedding)} 
-      LIMIT 5
+    // --- DIAGNOSTIC STEP ---
+    // Instead of querying the database, we are using a hardcoded context.
+    // This isolates the database connection as the potential point of failure.
+    const contextText = `
+      H-1B Proclamation of Sep 19, 2025: A $100,000 fee is required for certain H-1B beneficiaries.
+      F-1 Student OPT Rules: When traveling on OPT, students must carry their EAD card and their I-20 endorsed for travel by their DSO within the last six months.
     `;
-    const contextText = rows.map(r => r.content).join('\n\n---\n\n');
+    // --- END OF DIAGNOSTIC STEP ---
 
-    const prompt = `
-      You are a highly intelligent AI assistant for U.S. immigration questions.
-      Answer the user's question based ONLY on the provided context below.
-      If the context does not contain enough information, state that you cannot find the information in the provided documents.
-      Do not provide legal advice.
+    const prompt = \`
+      You are a helpful AI assistant. Answer the user's question based ONLY on the provided context.
 
       Context: """
-      ${contextText}
+      \${contextText}
       """
 
-      User Question: "${userQuery}"
+      User Question: "\${userQuery}"
 
       Answer:
-    `;
+    \`;
 
-    // 3. Call OpenAI to generate the final, streamed response
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       stream: true,
       messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1,
     });
 
     const stream = OpenAIStream(response);
