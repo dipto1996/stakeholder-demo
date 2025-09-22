@@ -1,104 +1,66 @@
-// This is the final, complete code for pages/api/chat.js
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
-
-// Import the knowledge base directly
-import proclamationContext from '../../data/proclamation.txt';
-import f1OptContext from '../../data/f1_opt_rules.txt';
-
-export const config = {
-  runtime: 'edge',
-};
+import { Pool } from 'pg';
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-const knowledgeBase = [
-  { name: 'proclamation', content: proclamationContext },
-  { name: 'f1_opt_rules', content: f1OptContext },
-];
-
-// Helper to create a stream from a simple string for greetings
-function createStreamFromString(text) {
-  const stream = new ReadableStream({
-    start(controller) {
-      controller.enqueue(new TextEncoder().encode(text));
-      controller.close();
-    }
-  });
-  return new StreamingTextResponse(stream);
-}
-
-const getContext = async (message) => {
-  let bestContext = 'No relevant context found.';
-  let bestScore = 0;
-  const queryWords = new Set(message.toLowerCase().split(/\s+/));
-
-  for (const doc of knowledgeBase) {
-    const contentWords = new Set(doc.content.toLowerCase().split(/\s+/));
-    let score = 0;
-    for (const word of queryWords) {
-      if (contentWords.has(word)) {
-        score++;
-      }
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestContext = doc.content;
-    }
+const pool = new Pool({
+  connectionString: process.env.POSTGRES_URL,
+  ssl: {
+    rejectUnauthorized: false
   }
-  return bestContext;
-};
+});
 
-export default async function handler(req) {
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed' });
+  }
+
   try {
     const { messages } = await req.json();
-    const currentMessageContent = messages[messages.length - 1].content;
-    const lowerCaseMessage = currentMessageContent.toLowerCase().trim();
+    const userQuery = messages[messages.length - 1].content;
 
-    // Greeting Detection Logic
-    const greetings = ['hello', 'hi', 'hey'];
-    const thanks = ['thanks', 'thank you'];
+    const embeddingResponse = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      input: userQuery,
+    });
+    const queryEmbedding = embeddingResponse.data[0].embedding;
 
-    if (greetings.includes(lowerCaseMessage)) {
-      return createStreamFromString("Hello! How can I help you with U.S. immigration questions today?");
+    const client = await pool.connect();
+    let contextText = '';
+    try {
+      const { rows } = await client.query(
+        'SELECT content FROM documents ORDER BY embedding <=> $1 LIMIT 5',
+        [JSON.stringify(queryEmbedding)]
+      );
+      contextText = rows.map(r => r.content).join('\n\n---\n\n');
+    } finally {
+      client.release();
     }
 
-    if (thanks.includes(lowerCaseMessage)) {
-      return createStreamFromString("You're welcome! Let me know if you have other questions.");
-    }
-
-    // RAG Logic
-    const context = await getContext(currentMessageContent);
-
-    const prompt = `
-      You are an AI assistant for U.S. immigration.
-      Answer the user's question based ONLY on the provided context.
-      Do not provide legal advice. If the context is not sufficient, state that you cannot find the information.
-
+    const prompt = \`
+      You are a highly intelligent AI assistant...
       Context: """
-      ${context}
+      ${contextText}
       """
-
-      User Question: "${currentMessageContent}"
-
+      User Question: "${userQuery}"
       Answer:
-    `;
+    \`;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       stream: true,
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.1,
-      max_tokens: 500,
     });
 
     const stream = OpenAIStream(response);
-    return new StreamingTextResponse(stream);
+    stream.pipe(res);
 
   } catch (error) {
     console.error('Error in chat API:', error);
-    return new Response('Internal Server Error', { status: 500 });
+    res.status(500).json({ error: 'Internal Server Error' });
   }
 }
