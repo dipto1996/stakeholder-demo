@@ -13,16 +13,15 @@ const pool = new Pool({
   }
 });
 
-// We do not need the Edge runtime for this to work
-// export const config = { runtime: 'edge' };
-
-export default async function handler(req) {
+export default async function handler(req, res) {
   if (req.method !== 'POST') {
-    return new Response('Method Not Allowed', { status: 405 });
+    return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
   try {
-    const { messages } = await req.json();
+    // This is the corrected line for the Node.js runtime
+    const { messages } = req.body;
+
     const userQuery = messages[messages.length - 1].content;
 
     const embeddingResponse = await openai.embeddings.create({
@@ -43,7 +42,7 @@ export default async function handler(req) {
       client.release();
     }
 
-    const prompt = `
+    const prompt = \`
       You are a highly intelligent AI assistant for U.S. immigration questions.
       Answer the user's question based ONLY on the provided context below.
       The context contains excerpts from the USCIS Policy Manual and other official sources.
@@ -51,13 +50,13 @@ export default async function handler(req) {
       Do not provide legal advice.
 
       Context: """
-      ${contextText}
+      \${contextText}
       """
 
-      User Question: "${userQuery}"
+      User Question: "\${userQuery}"
 
       Answer:
-    `;
+    \`;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -67,12 +66,10 @@ export default async function handler(req) {
     });
 
     const stream = OpenAIStream(response);
-
-    // This is the modern, correct way to return a stream
-    return new StreamingTextResponse(stream);
+    stream.pipe(res);
 
   } catch (error) {
     console.error('Error in chat API:', error);
-    return new Response(`Error: ${error.message}`, { status: 500 });
+    res.status(500).json({ error: 'Internal Server Error' });
   }
 }
