@@ -40,7 +40,7 @@ export default async function handler(req, res) {
       client.release();
     }
 
-    const prompt = `
+    const prompt = \`
       You are a highly intelligent AI assistant for U.S. immigration questions.
       Answer the user's question based ONLY on the provided context below.
       The context contains excerpts from the USCIS Policy Manual and other official sources.
@@ -48,13 +48,13 @@ export default async function handler(req, res) {
       Do not provide legal advice.
 
       Context: """
-      ${contextText}
+      \${contextText}
       """
 
-      User Question: "${userQuery}"
+      User Question: "\${userQuery}"
 
       Answer:
-    `;
+    \`;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -67,3 +67,16 @@ export default async function handler(req, res) {
 
     // This handles streaming in a standard Node.js environment
     if (res && typeof res.writeHead === 'function') {
+       stream.pipe(res);
+    } else {
+       return new StreamingTextResponse(stream);
+    }
+  } catch (error) { // THIS CLOSING BRACE WAS MISSING
+    console.error('Error in chat API:', error);
+    if (res && typeof res.status === 'function') {
+        res.status(500).json({ error: 'Internal Server Error' });
+    } else {
+        return new Response('Internal Server Error', { status: 500 });
+    }
+  }
+}
