@@ -1,4 +1,3 @@
-// This is a simplified, guaranteed-to-work version of pages/index.js
 import { useChat } from 'ai/react';
 import { useRef, useEffect } from 'react';
 
