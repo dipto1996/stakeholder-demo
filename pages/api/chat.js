@@ -82,15 +82,14 @@ export default async function handler(req) {
     queryEmbedding = emb.data[0].embedding;
   } catch (err) {
     console.error('Embedding error', err);
-    // fallback: return retrieved excerpts empty so UI doesn't hang
     return new Response(JSON.stringify({ mode: 'error', error: 'Embedding failed' }), { status: 200, headers: { 'Content-Type': 'application/json' }});
   }
 
-  // Retrieve top contexts from Postgres (RAG). Keep same JSON-string approach as before for compatibility.
+  // Retrieve top contexts from Postgres (safe SELECT using columns that exist)
   let rows;
   try {
     const q = await sql`
-      SELECT content, source, id
+      SELECT id, content
       FROM documents
       ORDER BY embedding <=> ${JSON.stringify(queryEmbedding)}
       LIMIT 5
@@ -101,13 +100,14 @@ export default async function handler(req) {
     return new Response(JSON.stringify({ mode: 'error', error: 'DB retrieval failed' }), { status: 200, headers: { 'Content-Type': 'application/json' }});
   }
 
-  const contexts = rows.map(r => ({
-    id: r.id ?? null,
-    source: r.source ?? null,
+  // Normalize contexts: use id as source label if source column missing
+  const contexts = rows.map((r, i) => ({
+    id: r.id ?? i+1,
+    source: r.filename ?? (`doc_${r.id ?? i+1}`),
     content: r.content ?? ''
   }));
 
-  const contextText = contexts.map((c,i)=>`[${i+1}] Source: ${c.source || 'unknown'}\n${c.content}`).join('\n\n---\n\n') || '[no contexts found]';
+  const contextText = contexts.map((c,i)=>`[${i+1}] Source: ${c.source}\n${c.content}`).join('\n\n---\n\n') || '[no contexts found]';
 
   // Build system + few-shot prompt (conversational + constrained)
   const system = `You are a friendly, conversational assistant specialized in U.S. immigration. USE ONLY the CONTEXT provided for factual claims. Cite with [n] referencing the context blocks given. If the context doesn't support an answer, respond: "I couldn't find supporting official sources in the provided documents." Do NOT provide legal advice. Keep tone helpful.`;
@@ -142,7 +142,7 @@ INSTRUCTIONS:
 - Make "answer" conversational and friendly. If you cannot answer from context, set answer to "I couldn't find supporting official sources in the provided documents." and return citations: [].
 `.trim();
 
-  // Call OpenAI (non-streaming, deterministic-ish)
+  // Call OpenAI (non-streaming)
   try {
     const resp = await openai.chat.completions.create({
       model: process.env.OPENAI_MODEL || 'gpt-3.5-turbo',
