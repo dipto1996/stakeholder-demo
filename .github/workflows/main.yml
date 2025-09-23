@@ -29,8 +29,10 @@ jobs:
 
       - name: Run Data Pipeline
         env:
+          # This is the corrected block with all necessary secrets
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
         run: python pipeline.py
