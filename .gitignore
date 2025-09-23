@@ -23,3 +23,6 @@
 # Misc
 .DS_Store
 *.pem
+
+# Custom user folder to ignore
+/jambi
