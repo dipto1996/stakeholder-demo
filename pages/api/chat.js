@@ -1,13 +1,5 @@
 // chat.js — Edge-ready RAG chat handler (Vercel Edge + @vercel/postgres + OpenAI)
-// Features:
-// - Edge runtime (export const config = { runtime: 'edge' })
-// - Embedding & completion retries with backoff
-// - pgvector cast for retrieval (embedding ::vector)
-// - Context trimming (per-excerpt + total budget)
-// - Empty-retrieval friendly fallback
-// - Sends a SOURCES_JSON preamble before the model stream so frontend can render citations
-// - Instructs model to include SUGGESTED JSON at end for UI chips
-// - Uses OpenAIStream + StreamingTextResponse for reliable streaming in Edge
+// IMPORTANT: No binary preamble. Model output only (so ai/react streaming parser works).
 
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
@@ -126,25 +118,38 @@ export default async function handler(req) {
     const contextText = parts.join('\n\n---\n\n');
 
     // 5) System prompt with few-shot + structured output requirement
+    // NOTE: We ask the model to include SUGGESTED JSON and SOURCES_JSON lines as part of the model output.
     const systemPrompt = `
 You are a friendly, careful, and accurate assistant for U.S. immigration questions (students, employees, employers).
+
 Rules:
 - Use ONLY the CONTEXT / SOURCES below for factual claims. Do NOT hallucinate.
 - Cite every factual claim with bracketed source numbers like [1], [2] that refer to the SOURCES block.
 - Output structure: (1) Short direct answer (1-3 sentences), (2) Key points (bulleted list), (3) Next steps (1-3 actionable items).
-- At the very end include a machine-parsable SUGGESTED JSON line exactly like: SUGGESTED: ["prompt 1", "prompt 2"]
+- At the very end include two machine-parsable lines EXACTLY like:
+  SUGGESTED: ["prompt 1", "prompt 2"]
+  SOURCES_JSON: <json array of {id,source,excerpt}>
 - Do NOT provide legal advice. If context is insufficient, say "I couldn't find supporting official sources in the provided documents."
+
 Example:
 Q: "Can I travel while on OPT?"
 A: "Short answer: Usually yes for active OPT, but carry EAD and signed I-20. [1]
 Key points:
 - Carry EAD and signed I-20. [1]
 Next steps:
-- Check your school's international student office."
+- Check your school's international student office.
+
+Then append:
+SUGGESTED: ["How to prepare for OPT travel","What to carry when traveling on OPT"]
+SOURCES_JSON: [{"id":1,"source":"uscis_opt_f1.txt","excerpt":"..."}]
 `;
 
+    // 6) Provide the context and the sources block to the model in the user prompt
     const userPrompt = `CONTEXT:
 ${contextText}
+
+SOURCES:
+${JSON.stringify(sources)}
 
 QUESTION:
 ${userQuery}
@@ -155,32 +160,15 @@ ${userQuery}
       { role: 'user', content: userPrompt }
     ];
 
-    // 6) Call chat completion (streaming) with retry
+    // 7) Call chat completion (streaming) with retry
     const completion = await createCompletionWithRetry(messagesForModel, /*stream*/ true);
 
-    // 7) Build preamble with structured sources JSON and then pipe model stream
-    const preamble = `SOURCES_JSON:${JSON.stringify(sources)}\n\n`;
-    const encodedPreamble = new TextEncoder().encode(preamble);
-
+    // 8) Stream model output directly (no custom preamble)
     // OpenAIStream returns a ReadableStream for the model output in Edge
     const modelStream = OpenAIStream(completion);
 
-    const combined = new ReadableStream({
-      async start(controller) {
-        // send preamble first
-        controller.enqueue(encodedPreamble);
-        // then pipe model stream
-        const reader = modelStream.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          controller.enqueue(value);
-        }
-        controller.close();
-      }
-    });
-
-    return new StreamingTextResponse(combined);
+    // Return the model stream as-is so ai/react can parse it.
+    return new StreamingTextResponse(modelStream);
 
   } catch (err) {
     console.error('chat handler error:', err);
