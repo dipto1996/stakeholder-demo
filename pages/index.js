@@ -8,7 +8,7 @@ export default function ChatPage() {
   const messagesEndRef = useRef(null);
 
   // useChat must be called after state hooks are declared
-  const { messages, input, setInput, handleInputChange, handleSubmit, append } = useChat({
+  const { messages, input, setInput, handleInputChange, handleSubmit, append, isLoading } = useChat({
     api: '/api/chat',
   });
 
