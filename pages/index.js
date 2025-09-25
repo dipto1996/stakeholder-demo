@@ -1,30 +1,15 @@
 // index.js — Final, Corrected Version
-// This version uses the `onFinish` callback to reliably parse metadata
-// after the stream is complete, fixing the silent render failure.
+// This version moves the parsing logic directly into the render function
+// to prevent state conflicts with the `useChat` hook, fixing the silent render failure.
 import { useChat } from 'ai/react';
 import { useRef, useEffect, useState } from 'react';
 
 export default function ChatPage() {
-  const [parsedSources, setParsedSources] = useState({});
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
   const { messages, input, setInput, handleInputChange, handleSubmit, isLoading } = useChat({
     api: '/api/chat',
-    // Use onFinish to parse metadata after the stream is complete
-    onFinish: (message) => {
-      const text = message.content || '';
-      const sourcesRegex = /^SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/;
-      const sourcesMatch = text.match(sourcesRegex);
-      if (sourcesMatch && sourcesMatch[1]) {
-        try {
-          const parsed = JSON.parse(sourcesMatch[1]);
-          setParsedSources(prev => ({ ...prev, [message.id]: parsed }));
-        } catch (e) {
-          console.warn('Failed to parse SOURCES_JSON for message', message.id, e);
-        }
-      }
-    }
   });
 
   // Fetch trending topics on component mount
@@ -39,6 +24,20 @@ export default function ChatPage() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // Helper to safely parse sources from a message's content
+  const parseSources = (content) => {
+    const sourcesRegex = /^SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/;
+    const sourcesMatch = content.match(sourcesRegex);
+    if (sourcesMatch && sourcesMatch[1]) {
+      try {
+        return JSON.parse(sourcesMatch[1]);
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  };
 
   // Helper to safely remove the metadata preamble from displayed content
   function stripMetadata(content) {
@@ -62,8 +61,8 @@ export default function ChatPage() {
       <main className="flex-1 overflow-y-auto p-4">
         <div className="space-y-4 max-w-3xl mx-auto">
           {messages.map((msg) => {
-            // The sources will be populated by the onFinish callback
-            const sources = parsedSources[msg.id];
+            // Perform parsing directly here instead of using a separate state
+            const sources = msg.role === 'assistant' ? parseSources(msg.content) : null;
             const cleanedContent = stripMetadata(msg.content);
 
             return (
