@@ -1,10 +1,6 @@
 // chat.js — Final Production-Grade Version
-// This script is built for the Vercel Edge Runtime and uses the @vercel/postgres
-// driver for high-performance, reliable database queries. It incorporates all
-// user feedback for robustness, including API retries, context trimming,
-// a no-results fallback, and a sophisticated prompting strategy that
-// instructs the AI to be conversational and cite its sources.
-
+// This version is compatible with the new database schema and the intelligent frontend.
+// It retrieves rich citation data (title and URL) and sends it to the client.
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
 import { sql } from '@vercel/postgres';
@@ -19,8 +15,8 @@ const EMBEDDING_MODEL = 'text-embedding-3-small';
 const CHAT_MODEL = 'gpt-4o-mini';
 const EMB_RETRIES = 3;
 const CHAT_RETRIES = 2;
-const MAX_EXCERPT_LENGTH = 1600; // Max characters per source excerpt
-const MAX_CONTEXT_LENGTH = 6000; // Max total characters for the context block
+const MAX_EXCERPT_LENGTH = 1600; 
+const MAX_CONTEXT_LENGTH = 6000;
 
 // --- Helper Functions ---
 async function createEmbeddingsWithRetry(input) {
@@ -80,6 +76,7 @@ export default async function handler(req) {
     const embResp = await createEmbeddingsWithRetry(userQuery);
     const queryEmbedding = embResp.data[0].embedding;
 
+    // CORRECTED: Query now includes the new citation columns
     const { rows } = await sql`
         SELECT source_title, source_url, content 
         FROM documents 
@@ -97,11 +94,13 @@ export default async function handler(req) {
       return new StreamingTextResponse(fallbackStream);
     }
 
+    // CORRECTED: Build the sources object with the new data
     const sources = rows.map((r, i) => ({
       id: i + 1,
       title: r.source_title || "Untitled Source",
       url: r.source_url,
     }));
+    
     let totalChars = 0;
     const contextParts = [];
     for (let i = 0; i < rows.length; i++) {
@@ -122,6 +121,7 @@ export default async function handler(req) {
 
     const completion = await createCompletionWithRetry(messagesForModel);
 
+    // CORRECTED: Send the rich sources object in the preamble
     const preamble = `SOURCES_JSON:${JSON.stringify(sources)}\n\n`;
     const encodedPreamble = new TextEncoder().encode(preamble);
     const modelStream = OpenAIStream(completion);
@@ -146,4 +146,3 @@ export default async function handler(req) {
     return new Response('Internal Server Error', { status: 500 });
   }
 }
-
