@@ -1,88 +1,93 @@
-// index.js — Final, Corrected Version
-// This version moves the parsing logic directly into the render function
-// to prevent state conflicts with the `useChat` hook, fixing the silent render failure.
+// pages/index.js — Frontend chat UI (full file)
+// - Parses SOURCES_JSON in onFinish
+// - Strips metadata for visible output
+// - Renders sources as blue underlined links inside a shaded box
 import { useChat } from 'ai/react';
 import { useRef, useEffect, useState } from 'react';
 
 export default function ChatPage() {
+  const [parsedSources, setParsedSources] = useState({});
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
   const { messages, input, setInput, handleInputChange, handleSubmit, isLoading } = useChat({
     api: '/api/chat',
+    onFinish: (message) => {
+      // parse SOURCES_JSON exactly once after stream completes
+      const text = message.content || '';
+      const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m;
+      const match = text.match(sourcesRegex);
+      if (match && match[1]) {
+        try {
+          const parsed = JSON.parse(match[1]);
+          setParsedSources(prev => ({ ...prev, [message.id]: parsed }));
+        } catch (e) {
+          console.warn('Failed to parse SOURCES_JSON', e);
+        }
+      }
+    }
   });
 
-  // Fetch trending topics on component mount
+  // Trending / sample prompts
   useEffect(() => {
     fetch('/trending.json')
       .then(res => res.json())
       .then(data => setTrendingTopics(data))
-      .catch(err => console.error("Failed to fetch trending topics:", err));
+      .catch(() => {});
   }, []);
 
-  // Auto-scroll to the latest message
+  // Auto-scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Helper to safely parse sources from a message's content
-  const parseSources = (content) => {
-    const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])/;
-    const sourcesMatch = content.match(sourcesRegex);
-    if (sourcesMatch && sourcesMatch[1]) {
-      try {
-        return JSON.parse(sourcesMatch[1]);
-      } catch (e) {
-        return null; // Return null if parsing fails
-      }
-    }
-    return null;
-  };
-
-  // Helper to safely remove the metadata preamble from displayed content
+  // Remove metadata blocks (SOURCES_JSON or SUGGESTED) from visible content
   function stripMetadata(content) {
     if (!content) return '';
-    return content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])/g, '').trim();
+    return content
+      .replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m, '')
+      .replace(/SUGGESTED:\s*(\[[\s\S]*?\])\s*$/m, '')
+      .trim();
   }
 
-  const defaultSuggestedPrompts = [
+  const suggestedPrompts = [
     "What are H-1B qualifications?",
     "What documents do I need for OPT travel?",
-    "Explain F-1 OPT policy.",
+    "Explain the F-1 OPT policy."
   ];
 
   return (
     <div className="flex flex-col h-screen bg-neutral-50 font-sans">
       <header className="p-4 border-b bg-white shadow-sm">
         <h1 className="text-xl font-semibold text-neutral-900">Immigration AI Assistant</h1>
-        <p className="text-sm text-neutral-500">Informational Tool - Not Legal Advice</p>
+        <p className="text-sm text-neutral-500">Informational Tool — Not Legal Advice</p>
       </header>
 
       <main className="flex-1 overflow-y-auto p-4">
         <div className="space-y-4 max-w-3xl mx-auto">
           {messages.map((msg) => {
-            // Perform parsing directly here inside the render loop
-            const sources = msg.role === 'assistant' ? parseSources(msg.content) : null;
-            const cleanedContent = stripMetadata(msg.content);
+            const cleaned = stripMetadata(msg.content);
+            const sources = parsedSources[msg.id] || [];
 
             return (
               <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
-                <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
-                  <p className="whitespace-pre-wrap text-sm">{cleanedContent}</p>
+                <div className={'max-w-xl p-4 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
+                  <div className="whitespace-pre-wrap text-sm" dangerouslySetInnerHTML={{ __html: formatMarkdownSafe(cleaned) }} />
 
-                  {sources && sources.length > 0 && (
-                    <div className="mt-2 border-t border-neutral-200 pt-2">
-                      <p className="text-xs font-semibold text-neutral-600 mb-1">Sources:</p>
+                  {/* Sources box: subtle shade, small text, blue underlined links */}
+                  {sources.length > 0 && (
+                    <div className="mt-3 p-3 rounded-md bg-neutral-50 border border-neutral-100">
+                      <p className="text-xs font-semibold text-neutral-600 mb-2">Sources</p>
                       <div className="space-y-1">
-                        {sources.map(source => (
-                          <div key={source.id} className="text-xs text-neutral-500">
-                            [{source.id}] {' '}
-                            {source.url ? (
-                              <a href={source.url} target="_blank" rel="noopener noreferrer" className="underline hover:text-brand-blue">
-                                {source.title}
+                        {sources.map(src => (
+                          <div key={src.id} className="text-xs text-neutral-600">
+                            [{src.id}] {' '}
+                            {src.url ? (
+                              <a href={src.url} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">
+                                {src.title || src.url}
                               </a>
                             ) : (
-                              source.title
+                              <span className="text-neutral-700">{src.title}</span>
                             )}
                           </div>
                         ))}
@@ -93,6 +98,7 @@ export default function ChatPage() {
               </div>
             );
           })}
+
           <div ref={messagesEndRef} />
         </div>
       </main>
@@ -103,10 +109,10 @@ export default function ChatPage() {
             <div className="mb-4">
               <h3 className="text-sm font-semibold text-neutral-700 mb-2">Trending Topics</h3>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-                {trendingTopics.map((topic, index) => (
-                  <div key={index} className="p-3 bg-neutral-100 rounded-md border border-neutral-200">
-                    <p className="font-semibold text-sm text-neutral-900">{topic.title}</p>
-                    <p className="text-xs text-neutral-500">{topic.blurb}</p>
+                {trendingTopics.map((t, i) => (
+                  <div key={i} className="p-3 bg-neutral-100 rounded-md border border-neutral-200">
+                    <p className="font-semibold text-sm text-neutral-900">{t.title}</p>
+                    <p className="text-xs text-neutral-500">{t.blurb}</p>
                   </div>
                 ))}
               </div>
@@ -115,9 +121,9 @@ export default function ChatPage() {
 
           {messages.length === 0 && (
             <div className="mb-3 flex flex-wrap gap-2">
-              {defaultSuggestedPrompts.map((prompt, index) => (
-                <button key={index} onClick={() => setInput(prompt)} className="px-3 py-1 bg-neutral-200 text-neutral-700 text-sm rounded-full hover:bg-neutral-300 transition-colors">
-                  {prompt}
+              {suggestedPrompts.map((p, idx) => (
+                <button key={idx} onClick={() => setInput(p)} className="px-3 py-1 bg-neutral-200 text-neutral-700 text-sm rounded-full hover:bg-neutral-300">
+                  {p}
                 </button>
               ))}
             </div>
@@ -132,11 +138,7 @@ export default function ChatPage() {
                 className="flex-1 p-2 border border-neutral-200 rounded-md focus:ring-2 focus:ring-brand-blue focus:outline-none"
                 disabled={isLoading}
               />
-              <button
-                type="submit"
-                disabled={isLoading}
-                className="px-4 py-2 bg-brand-blue text-white font-semibold rounded-md disabled:bg-gray-400 hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-brand-blue transition-colors"
-              >
+              <button type="submit" disabled={isLoading} className="px-4 py-2 bg-brand-blue text-white font-semibold rounded-md disabled:bg-gray-400">
                 Send
               </button>
             </div>
@@ -147,3 +149,29 @@ export default function ChatPage() {
   );
 }
 
+/**
+ * Minimal, safe markdown-ish formatter for display:
+ * - Converts simple **bold** and bullet lines into HTML
+ * - Keeps text safe (very lightweight). If you use a markdown library, swap here.
+ */
+function formatMarkdownSafe(text) {
+  if (!text) return '';
+  // escape HTML characters
+  const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+  // basic transformations
+  const lines = esc(text).split('\n');
+  const out = [];
+  for (const line of lines) {
+    if (line.trim().startsWith('- ')) {
+      out.push(`<li>${line.trim().slice(2)}</li>`);
+    } else {
+      // bold **text**
+      const bolded = line.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+      out.push(`<p>${bolded}</p>`);
+    }
+  }
+  // wrap consecutive <li> into a <ul>
+  const html = out.join('');
+  // quick combine adjacent <li> into UL groups
+  return html.replace(/(<li>.*?<\/li>)+/gs, (m) => `<ul class="ml-4 list-disc">${m}</ul>`);
+}
