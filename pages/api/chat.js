@@ -10,11 +10,10 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // Tunables
 const EMBEDDING_MODEL = 'text-embedding-3-small';
 const CHAT_MODEL = 'gpt-4o-mini';
-const VECTOR_DIMENSION = 1536;
-const MAX_EXCERPT = 1600;
-const MAX_CONTEXT_TOTAL = 6000;
 const EMB_RETRIES = 3;
 const CHAT_RETRIES = 2;
+const MAX_EXCERPT_LENGTH = 1600;
+const MAX_CONTEXT_LENGTH = 6000;
 
 async function createEmbeddingsWithRetry(input) {
   for (let attempt = 0; attempt < EMB_RETRIES; attempt++) {
@@ -24,23 +23,23 @@ async function createEmbeddingsWithRetry(input) {
       return r;
     } catch (e) {
       if (attempt === EMB_RETRIES - 1) throw e;
-      await new Promise(r => setTimeout(r, 2 ** attempt * 1000));
+      await new Promise((res) => setTimeout(res, 2 ** attempt * 1000));
     }
   }
 }
 
-async function createCompletionWithRetry(messages) {
+async function createCompletionWithRetry(messages, stream = true) {
   for (let attempt = 0; attempt < CHAT_RETRIES; attempt++) {
     try {
       return await openai.chat.completions.create({
         model: CHAT_MODEL,
-        stream: true,
+        stream,
         messages,
         temperature: 0.15,
       });
     } catch (e) {
       if (attempt === CHAT_RETRIES - 1) throw e;
-      await new Promise(r => setTimeout(r, 2 ** attempt * 1000));
+      await new Promise((res) => setTimeout(res, 2 ** attempt * 1000));
     }
   }
 }
@@ -56,28 +55,28 @@ export default async function handler(req) {
     if (!Array.isArray(messages) || messages.length === 0) {
       return new Response('Invalid request body', { status: 400 });
     }
+
     const userQuery = (messages[messages.length - 1].content || '').trim();
     if (!userQuery) return new Response('Empty user query', { status: 400 });
 
-    // greeting shortcut
+    // Greeting shortcut: use the model rather than raw bytes so the stream format matches.
     const GREETING_RE = /^(hi|hello|hey|good morning|good afternoon|good evening)\b/i;
     if (GREETING_RE.test(userQuery)) {
-      const greeting = "Hello! 👋 I can help explain U.S. immigration rules (H-1B, F-1, OPT, CPT). What would you like to know?";
-      const s = new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode(greeting));
-          controller.close();
-        }
-      });
-      return new StreamingTextResponse(s);
+      const greetingMessages = [
+        { role: 'system', content: 'You are a friendly assistant.' },
+        { role: 'user', content: 'Say a short friendly greeting and ask how you can help with US immigration in one sentence.' },
+      ];
+      const completion = await createCompletionWithRetry(greetingMessages);
+      const modelStream = OpenAIStream(completion);
+      return new StreamingTextResponse(modelStream);
     }
 
-    // 1) Embedding
+    // 1) embedding
     const embResp = await createEmbeddingsWithRetry(userQuery);
     const queryEmbedding = embResp.data[0].embedding;
     const embLiteral = JSON.stringify(queryEmbedding);
 
-    // 2) Retrieve top-k from Postgres (vercel/postgres)
+    // 2) retrieve top-k docs (expects documents table to have source_title, source_url, content, embedding)
     const q = await sql`
       SELECT source_title, source_url, content
       FROM documents
@@ -86,81 +85,64 @@ export default async function handler(req) {
     `;
     const rows = q?.rows ?? [];
 
-    // 3) Fallback if none
     if (!rows || rows.length === 0) {
-      const fallback = "I couldn't find supporting documents in our indexed sources for that question. Would you like (A) broader search, (B) general guidance, or (C) lawyer review?";
-      const s = new ReadableStream({
+      // Friendly fallback (no LLM call) — keep streaming format
+      const fallbackText = "I couldn't find supporting documents in our indexed sources for that question. Would you like (A) a broader search, (B) general guidance, or (C) lawyer review?";
+      const fallbackStream = new ReadableStream({
         start(controller) {
-          controller.enqueue(new TextEncoder().encode(fallback));
+          controller.enqueue(new TextEncoder().encode(fallbackText));
           controller.close();
         }
       });
-      return new StreamingTextResponse(s);
+      return new StreamingTextResponse(fallbackStream);
     }
 
-    // 4) Build trimmed sources & contextText
+    // 3) Build sources (title + url) and context (trimmed)
     const sources = rows.map((r, i) => ({
       id: i + 1,
-      title: r.source_title || `source_${i + 1}`,
+      title: r.source_title || 'Untitled Source',
       url: r.source_url || null,
     }));
 
-    let tot = 0;
-    const parts = [];
+    let totalChars = 0;
+    const contextParts = [];
     for (let i = 0; i < rows.length; i++) {
-      const excerpt = (rows[i].content || '').slice(0, MAX_EXCERPT);
-      if (tot + excerpt.length > MAX_CONTEXT_TOTAL) break;
-      parts.push(`[${i + 1}] title: ${rows[i].source_title}\ncontent: ${excerpt}`);
-      tot += excerpt.length;
+      const excerpt = (rows[i].content || '').slice(0, MAX_EXCERPT_LENGTH);
+      if (totalChars + excerpt.length > MAX_CONTEXT_LENGTH) break;
+      contextParts.push(`[${i + 1}] source_title: ${rows[i].source_title || 'Untitled'}\ncontent: ${excerpt}`);
+      totalChars += excerpt.length;
     }
-    const contextText = parts.join('\n\n---\n\n');
+    const contextText = contextParts.join('\n\n---\n\n');
 
-    // 5) System & user prompt
-    const systemPrompt = `
-You are a friendly, careful, and accurate assistant for U.S. immigration questions.
-Rules:
-- Use ONLY the CONTEXT / SOURCES below for factual claims. Do NOT hallucinate.
-- Cite every factual claim with bracketed source numbers like [1], [2] that refer to the SOURCES block.
-- Output structure: (1) Short direct answer (1-3 sentences), (2) Key points (bulleted list), (3) Next steps (1-3 actionable items).
-- At the very end include a machine-parsable SUGGESTED JSON line exactly like: SUGGESTED: ["prompt 1", "prompt 2"]
-- Do NOT provide legal advice. If the context is insufficient, say "I couldn't find supporting official sources in the provided documents."
-`;
-    const userPrompt = `CONTEXT:
-${contextText}
-
-QUESTION:
-${userQuery}
-`;
+    // 4) prompts
+    const systemPrompt = `You are a friendly and professional AI assistant for U.S. immigration questions. Use ONLY the numbered sources in the CONTEXT section below to answer the user's QUESTION. Cite factual claims with [1], [2], etc. Output: (1) short answer, (2) key points (bulleted), (3) next steps. Do NOT provide legal advice. If context insufficient, say you cannot find it in the provided documents.`;
+    const userPrompt = `CONTEXT:\n${contextText}\n\nQUESTION:\n${userQuery}`;
 
     const messagesForModel = [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt }
+      { role: 'user', content: userPrompt },
     ];
 
-    // 6) Get streaming completion
-    const completion = await createCompletionWithRetry(messagesForModel);
+    // 5) call model (stream)
+    const completion = await createCompletionWithRetry(messagesForModel, /*stream*/ true);
     const modelStream = OpenAIStream(completion);
 
-    // 7) We'll stream **modelStream first**, then **append** the SOURCES_JSON block after it finishes.
-    // This avoids breaking the streaming parser on the client.
-    const sourcesSuffix = `\n\nSOURCES_JSON:${JSON.stringify(sources)}\n`; // appended at the end of assistant text
-    const encodedSuffix = new TextEncoder().encode(sourcesSuffix);
+    // 6) append trailing SOURCES_JSON after model stream so frontend onFinish can parse it
+    const suffix = `\n\nSOURCES_JSON:${JSON.stringify(sources)}\n`;
+    const encodedSuffix = new TextEncoder().encode(suffix);
 
     const combined = new ReadableStream({
       async start(controller) {
-        // pipe model stream first
+        // pipe modelStream first
         const reader = modelStream.getReader();
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
-          }
-        } finally {
-          // After model stream ends, enqueue our suffix with sources JSON
-          controller.enqueue(encodedSuffix);
-          controller.close();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
         }
+        // then append suffix
+        controller.enqueue(encodedSuffix);
+        controller.close();
       }
     });
 
