@@ -3,26 +3,21 @@ import { useChat } from 'ai/react';
 import { useRef, useEffect, useState } from 'react';
 
 export default function ChatPage() {
-  // ----- state must be declared BEFORE calling useChat -----
   const [parsedSources, setParsedSources] = useState({});
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
-  // useChat hook (after state declarations)
   const { messages, input, setInput, handleInputChange, handleSubmit, append, isLoading } = useChat({
     api: '/api/chat',
-    // onFinish triggers after a streamed assistant message is complete
     onFinish: (message) => {
       if (!message || message.role !== 'assistant') return;
       const text = message.content || '';
-
-      // non-greedy, multi-line match for SOURCES_JSON preamble at the start
-      const sourcesRegex = /^\s*SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/;
+      // Accept optional leading "data: " (SSE preamble) and whitespace
+      const sourcesRegex = /^\s*(?:data:\s*)?SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/;
       const match = text.match(sourcesRegex);
       if (match && match[1]) {
         try {
           const parsed = JSON.parse(match[1]);
-          // store sources keyed by message id
           setParsedSources(prev => ({ ...prev, [message.id]: parsed }));
         } catch (e) {
           console.warn('Failed to parse SOURCES_JSON for message', message.id, e);
@@ -32,25 +27,18 @@ export default function ChatPage() {
   });
 
   useEffect(() => {
-    // scroll to bottom when messages update
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
   useEffect(() => {
-    // load trending topics optionally (static JSON in /public/trending.json)
-    fetch('/trending.json')
-      .then(r => r.json())
-      .then(setTrendingTopics)
-      .catch(() => {});
+    fetch('/trending.json').then(r => r.json()).then(setTrendingTopics).catch(() => {});
   }, []);
 
-  // Helper to remove SOURCES_JSON preamble when displaying
   function stripPreamble(content) {
     if (!content) return '';
-    return content.replace(/^\s*SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/, '').trim();
+    return content.replace(/^\s*(?:data:\s*)?SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/, '').trim();
   }
 
-  // Suggested prompts
   const suggestedPrompts = [
     "What are H-1B qualifications?",
     "What documents do I need for OPT travel?",
@@ -70,7 +58,6 @@ export default function ChatPage() {
             const cleaned = stripPreamble(msg.content || '');
             const sources = parsedSources[msg.id] || [];
             const isUser = msg.role === 'user';
-
             return (
               <div key={msg.id} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
                 <div className={`max-w-xl p-3 rounded-lg shadow-sm ${isUser ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200'}`}>
