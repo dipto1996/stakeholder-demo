@@ -12,8 +12,8 @@ const EMBEDDING_MODEL = 'text-embedding-3-small';
 const CHAT_MODEL = 'gpt-4o-mini';
 const EMB_RETRIES = 3;
 const CHAT_RETRIES = 2;
-const MAX_EXCERPT_LENGTH = 1600; // characters per excerpt
-const MAX_CONTEXT_LENGTH = 6000;  // total characters of context
+const MAX_EXCERPT_LENGTH = 1600;
+const MAX_CONTEXT_LENGTH = 6000;
 
 async function createEmbeddingsWithRetry(text) {
   for (let attempt = 0; attempt < EMB_RETRIES; attempt++) {
@@ -59,7 +59,7 @@ export default async function handler(req) {
     const userQuery = (messages[messages.length - 1].content || '').trim();
     if (!userQuery) return new Response('Empty user query', { status: 400 });
 
-    // Quick greeting shortcut (fast, avoids embeddings/cost)
+    // Quick greeting shortcut (cheap)
     const GREETING_RE = /^(hi|hello|hey|good morning|good afternoon|good evening)[!.]?\s*$/i;
     if (GREETING_RE.test(userQuery)) {
       const greeting = "Hello! 👋 I can help explain U.S. immigration topics (H-1B, F-1, OPT, CPT). What would you like to know?";
@@ -72,13 +72,12 @@ export default async function handler(req) {
       return new StreamingTextResponse(s);
     }
 
-    // 1) Embedding (retry)
+    // 1) Embedding
     const embResp = await createEmbeddingsWithRetry(userQuery);
     const queryEmbedding = embResp.data[0].embedding;
     const embLiteral = JSON.stringify(queryEmbedding);
 
-    // 2) Retrieve top-k relevant documents from Neon/Postgres via @vercel/postgres
-    // Note: cast to ::vector in SQL; @vercel/postgres will substitute our embLiteral string safely
+    // 2) Retrieve top-k
     const q = await sql`
       SELECT source_title, source_url, content
       FROM documents
@@ -87,7 +86,6 @@ export default async function handler(req) {
     `;
     const rows = q?.rows ?? [];
 
-    // 3) No results fallback
     if (!rows || rows.length === 0) {
       const fallback = "I couldn't find supporting documents in our indexed sources for that question. Would you like (A) a broader search, (B) general guidance, or (C) lawyer review?";
       const s = new ReadableStream({
@@ -99,7 +97,7 @@ export default async function handler(req) {
       return new StreamingTextResponse(s);
     }
 
-    // 4) Build trimmed context and sources list (respect budgets)
+    // 3) Build sources and context
     const sources = rows.map((r, i) => ({
       id: i + 1,
       title: r.source_title || `Source ${i + 1}`,
@@ -116,9 +114,7 @@ export default async function handler(req) {
     }
     const contextText = contextParts.join('\n\n---\n\n');
 
-    // 5) System + user prompt (conversational + citation instructions)
-    const systemPrompt = `You are a friendly, careful AI assistant for U.S. immigration questions. Use ONLY the provided CONTEXT / SOURCES for factual claims. Cite facts with bracketed numbers like [1], [2] that map to the SOURCES block. Provide a short direct answer, then key points (bullet list), then next steps. Do NOT provide legal advice. If the context is insufficient, say you couldn't find the answer in the provided documents. At the end, output a machine-parsable SUGGESTED line: SUGGESTED: ["followup 1","followup 2"]`;
-
+    const systemPrompt = `You are a friendly, careful AI assistant for U.S. immigration questions. Use ONLY the provided CONTEXT / SOURCES for factual claims. Cite facts with bracketed numbers like [1], [2]. Provide a short direct answer, key points (bulleted list), and next steps. Do NOT provide legal advice. If context is insufficient, say you couldn't find the answer in the provided documents. At the end output SUGGESTED: ["followup 1","followup 2"]`;
     const userPrompt = `CONTEXT:\n${contextText}\n\nQUESTION:\n${userQuery}`;
 
     const messagesForModel = [
@@ -126,18 +122,27 @@ export default async function handler(req) {
       { role: 'user', content: userPrompt }
     ];
 
-    // 6) Call chat completion (streaming) with retry
+    // 4) Chat completion (stream)
     const completion = await createCompletionWithRetry(messagesForModel);
 
-    // 7) Build preamble with sources and stream combined output
-    const preamble = `SOURCES_JSON:${JSON.stringify(sources)}\n\n`;
-    const encodedPreamble = new TextEncoder().encode(preamble);
+    // 5) Prepare preamble AS AN SSE 'data: ' CHUNK (THIS IS THE CRITICAL FIX)
+    // Important: we wrap JSON into an SSE data line so the ai/react client can parse the stream.
+    const sourcesJson = JSON.stringify(sources);
+    const preambleText = `SOURCES_JSON:${sourcesJson}\n\n`;
+    // Format as an SSE `data:` line (OpenAIStream expects SSE framing).
+    const preambleSSE = `data: ${preambleText}\n\n`;
+    const encodedPreamble = new TextEncoder().encode(preambleSSE);
+
+    // 6) Model stream produced by OpenAIStream (SSE formatted)
     const modelStream = OpenAIStream(completion);
 
+    // 7) Combined stream: first the SSE preamble, then the model SSE stream
     const combined = new ReadableStream({
       async start(controller) {
-        // send preamble then model stream
+        // enqueue the preamble as an SSE event
         controller.enqueue(encodedPreamble);
+
+        // pipe the model SSE stream after
         const reader = modelStream.getReader();
         while (true) {
           const { done, value } = await reader.read();
