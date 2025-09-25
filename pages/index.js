@@ -1,4 +1,3 @@
-// index.js — Full-featured Chat UI with sources, suggestions, trending topics
 import { useChat } from 'ai/react';
 import { useRef, useEffect, useState } from 'react';
 
@@ -10,10 +9,12 @@ export default function ChatPage() {
 
   const { messages, input, setInput, handleInputChange, handleSubmit, append, isLoading } = useChat({
     api: '/api/chat',
+    // CORRECTED: Use onFinish to reliably parse metadata after the stream is complete
     onFinish: (message) => {
       const text = message.content || '';
-      // Sources
-      const sourcesRegex = /^SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/;
+      const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])\s*/;
+      const suggestedRegex = /SUGGESTED:\s*(\[[\s\S]*?\])\s*$/m;
+
       const sourcesMatch = text.match(sourcesRegex);
       if (sourcesMatch && sourcesMatch[1]) {
         try {
@@ -23,8 +24,7 @@ export default function ChatPage() {
           console.warn('Failed to parse SOURCES_JSON:', e);
         }
       }
-      // Suggested
-      const suggestedRegex = /SUGGESTED:\s*(\[[\s\S]*?\])$/m;
+
       const suggestedMatch = text.match(suggestedRegex);
       if (suggestedMatch && suggestedMatch[1]) {
         try {
@@ -37,7 +37,6 @@ export default function ChatPage() {
     }
   });
 
-  // Fetch trending
   useEffect(() => {
     fetch('/trending.json')
       .then(res => res.json())
@@ -45,12 +44,10 @@ export default function ChatPage() {
       .catch(() => {});
   }, []);
 
-  // Scroll to bottom
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Strip metadata
   function stripMetadata(content) {
     return (content || '')
       .replace(/^SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/, '')
@@ -58,7 +55,6 @@ export default function ChatPage() {
       .trim();
   }
 
-  // Handle suggested click
   function handleSuggestedClick(prompt) {
     append({ role: 'user', content: prompt });
   }
@@ -66,7 +62,7 @@ export default function ChatPage() {
   const defaultSuggested = [
     "What are H-1B qualifications?",
     "What documents do I need for OPT travel?",
-    "Explain F-1 OPT policy."
+    "Explain the F-1 OPT policy."
   ];
 
   return (
@@ -85,10 +81,7 @@ export default function ChatPage() {
 
             return (
               <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
-                <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (msg.role === 'user'
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-white text-neutral-900 border border-neutral-200')}>
-                  
+                <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-blue-600 text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
                   <p className="whitespace-pre-wrap text-sm">{cleaned}</p>
 
                   {sources && sources.length > 0 && (
