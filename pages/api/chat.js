@@ -120,7 +120,11 @@ export default async function handler(req) {
     const completion = await createCompletionWithRetry(messagesForModel);
 
     // The Vercel AI SDK handles the streaming response
-    const stream = OpenAIStream(completion);
+    const stream = OpenAIStream(completion, {
+        onFinal(completion) {
+            // This is a good place to add logging or other final actions
+        },
+    });
     return new StreamingTextResponse(stream);
 
   } catch (err) {
