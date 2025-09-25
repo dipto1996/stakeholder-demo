@@ -14,7 +14,8 @@ export default function ChatPage() {
     // Use onFinish to parse metadata after the stream is complete
     onFinish: (message) => {
       const text = message.content || '';
-      const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])/;
+      // CORRECTED: Use a more robust, multi-line regex
+      const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m;
       const sourcesMatch = text.match(sourcesRegex);
       if (sourcesMatch && sourcesMatch[1]) {
         try {
@@ -43,7 +44,8 @@ export default function ChatPage() {
   // Helper to safely remove the metadata preamble from displayed content
   function stripMetadata(content) {
     if (!content) return '';
-    return content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])/g, '').trim();
+    // CORRECTED: Use a more robust, multi-line regex
+    return content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m, '').trim();
   }
 
   const defaultSuggestedPrompts = [
