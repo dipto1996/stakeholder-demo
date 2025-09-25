@@ -1,94 +1,66 @@
+// index.js — Final Version with Structured Data Handling
+// This version uses the `data` object from the useChat hook to reliably
+// receive and render metadata, fixing the race condition bug.
 import { useChat } from 'ai/react';
 import { useRef, useEffect, useState } from 'react';
 
 export default function ChatPage() {
-  const [parsedSources, setParsedSources] = useState({});
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
-  const { messages, input, setInput, handleInputChange, handleSubmit, isLoading } = useChat({
+  // CORRECTED: Destructure the `data` object from the useChat hook
+  const { messages, input, setInput, handleInputChange, handleSubmit, isLoading, data } = useChat({
     api: '/api/chat',
-    onFinish: (message) => {
-      const text = message.content || '';
-      const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])/;
-      const sourcesMatch = text.match(sourcesRegex);
-      if (sourcesMatch && sourcesMatch[1]) {
-        try {
-          const parsed = JSON.parse(sourcesMatch[1]);
-          setParsedSources(prev => ({ ...prev, [message.id]: parsed }));
-        } catch (e) {
-          console.warn('Failed to parse SOURCES_JSON for message', message.id, e);
-        }
-      }
-    }
   });
 
   useEffect(() => {
     fetch('/trending.json')
       .then(res => res.json())
       .then(data => setTrendingTopics(data))
-      .catch(() => {});
+      .catch(err => console.error("Failed to fetch trending topics:", err));
   }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  function stripMetadata(content) {
-    if (!content) return '';
-    return content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])/g, '').trim();
-  }
-
-  // Helper to get the domain from a URL for display
-  function getDomainFromUrl(url) {
-    try {
-      return new URL(url).hostname.replace('www.', '');
-    } catch (e) {
-      return null;
-    }
-  }
-
   const defaultSuggestedPrompts = [
     "What are H-1B qualifications?",
     "What documents do I need for OPT travel?",
-    "Explain F-1 OPT policy."
+    "Explain F-1 OPT policy.",
   ];
 
   return (
     <div className="flex flex-col h-screen bg-neutral-50 font-sans">
       <header className="p-4 border-b bg-white shadow-sm">
         <h1 className="text-xl font-semibold text-neutral-900">Immigration AI Assistant</h1>
-        <p className="text-sm text-neutral-500">Informational Tool — Not Legal Advice</p>
+        <p className="text-sm text-neutral-500">Informational Tool - Not Legal Advice</p>
       </header>
 
       <main className="flex-1 overflow-y-auto p-4">
         <div className="space-y-4 max-w-3xl mx-auto">
-          {messages.map((msg) => {
-            const cleanedContent = stripMetadata(msg.content);
-            const sources = parsedSources[msg.id];
+          {messages.map((msg, index) => {
+            // CORRECTED: Get sources directly from the synchronized `data` array
+            const sources = data?.[index]?.sources;
 
             return (
               <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
                 <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
-                  <p className="whitespace-pre-wrap text-sm">{cleanedContent}</p>
+                  <p className="whitespace-pre-wrap text-sm">{msg.content}</p>
 
                   {sources && sources.length > 0 && (
-                    <div className="mt-3 border-t border-neutral-200 pt-3">
-                      <p className="text-xs font-semibold text-neutral-700 mb-2">Sources:</p>
-                      <div className="grid grid-cols-1 gap-2">
+                    <div className="mt-2 border-t border-neutral-200 pt-2">
+                      <p className="text-xs font-semibold text-neutral-600 mb-1">Sources:</p>
+                      <div className="space-y-1">
                         {sources.map(source => (
-                          <div key={source.id} className="p-2 bg-neutral-50 rounded-md border border-neutral-200">
-                            <p className="text-xs text-neutral-900 font-medium truncate">
-                              {source.url ? (
-                                <a href={source.url} target="_blank" rel="noopener noreferrer" className="hover:underline">
-                                  {source.title}
-                                </a>
-                              ) : (
-                                source.title
-                              )}
-                            </p>
-                            {source.url && (
-                                <p className="text-xs text-neutral-500 mt-1">{getDomainFromUrl(source.url)}</p>
+                          <div key={source.id} className="text-xs text-neutral-500">
+                            [{source.id}] {' '}
+                            {source.url ? (
+                              <a href={source.url} target="_blank" rel="noopener noreferrer" className="underline hover:text-brand-blue">
+                                {source.title}
+                              </a>
+                            ) : (
+                              source.title
                             )}
                           </div>
                         ))}
