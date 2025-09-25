@@ -1,89 +1,117 @@
-// chat.js — Final Version with Structured Data Streaming
-import { OpenAIStream, StreamingTextResponse } from 'ai';
-import OpenAI from 'openai';
-import { sql } from '@vercel/postgres';
-
-export const config = { runtime: 'edge' };
+// pages/api/chat.js
+import OpenAI from "openai";
+import { sql } from "@vercel/postgres";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-export default async function handler(req) {
-  try {
-    const { messages } = await req.json();
-    const userQuery = messages[messages.length - 1].content;
+export default async function handler(req, res) {
+  if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
 
-    // --- Greeting Handler ---
-    const GREETING_RE = /^(hi|hello|hey)\b/i;
-    if (GREETING_RE.test(userQuery)) {
-      const stream = new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode("Hello! How can I help with your U.S. immigration questions?"));
-          controller.close();
-        }
-      });
-      return new StreamingTextResponse(stream);
+  try {
+    const { messages } = req.body || {};
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: "messages required" });
     }
 
-    // --- RAG Pipeline ---
+    const userQuery = (messages[messages.length - 1].content || "").trim();
+    if (!userQuery) return res.status(400).json({ error: "empty user query" });
+
+    // Quick greeting shortcut (cheap)
+    const GREETING_RE = /^(hi|hello|hey|good morning|good afternoon|good evening)\b/i;
+    if (GREETING_RE.test(userQuery)) {
+      return res.status(200).json({
+        answer: "Hello! 👋 I can help explain U.S. immigration rules (H-1B, F-1, OPT, CPT). What would you like to know?",
+        sources: []
+      });
+    }
+
+    // 1) Create embedding for query
     const embResp = await openai.embeddings.create({
-      model: 'text-embedding-3-small',
+      model: "text-embedding-3-small",
       input: userQuery,
     });
-    const queryEmbedding = embResp.data[0].embedding;
+    const queryEmbedding = embResp?.data?.[0]?.embedding;
+    if (!queryEmbedding) throw new Error("Embedding failed");
 
-    const { rows } = await sql`
-        SELECT source_title, source_url, content 
-        FROM documents 
-        ORDER BY embedding <=> ${JSON.stringify(queryEmbedding)}::vector
-        LIMIT 5
+    const embLiteral = JSON.stringify(queryEmbedding);
+
+    // 2) Retrieve top documents (assumes documents table has source_title, source_url, content, embedding)
+    const q = await sql`
+      SELECT source_title, source_url, content
+      FROM documents
+      ORDER BY embedding <=> ${embLiteral}::vector
+      LIMIT 5
     `;
+    const rows = q?.rows ?? [];
 
-    if (!rows || rows.length === 0) {
-      const fallbackStream = new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode("I couldn't find supporting documents in our indexed sources for that question."));
-          controller.close();
-        }
+    // If no docs found, return helpful fallback (no LLM cost)
+    if (!rows.length) {
+      return res.status(200).json({
+        answer: "I couldn't find supporting documents in our indexed sources for that question. Would you like me to answer more generally or run a broader search?",
+        sources: []
       });
-      return new StreamingTextResponse(fallbackStream);
     }
 
-    const sources = rows.map((r, i) => ({
-      id: i + 1,
-      title: r.source_title || "Untitled Source",
-      url: r.source_url,
-    }));
-    
-    const contextText = rows.map((r, i) => `[${i + 1}] source: ${r.source_title || 'Unknown Source'}\ncontent: ${r.content}`).join('\n\n---\n\n');
-    
-    const systemPrompt = `You are a friendly and professional AI assistant for U.S. immigration questions. Use ONLY the numbered sources in the CONTEXT section below to answer the user's QUESTION. You must cite your sources for every factual claim you make using the format [1], [2], etc. Your response should be structured with a short direct answer, followed by key points in a bulleted list, and finally a list of next steps. Do NOT provide legal advice.`;
-    const userPrompt = `CONTEXT:\n${contextText}\n\nQUESTION:\n${userQuery}`;
+    // 3) Build a trimmed context for the model
+    const MAX_EXCERPT = 1200;
+    const MAX_CONTEXT_TOTAL = 4000;
+    let total = 0;
+    const parts = [];
+    const sources = [];
+    for (let i = 0; i < rows.length; i++) {
+      const title = rows[i].source_title || `Source ${i + 1}`;
+      const url = rows[i].source_url || null;
+      const excerpt = (rows[i].content || "").slice(0, MAX_EXCERPT);
+      if (total + excerpt.length > MAX_CONTEXT_TOTAL) break;
+      total += excerpt.length;
+      parts.push(`[${i + 1}] ${title}\n${excerpt}`);
+      sources.push({ id: i + 1, title, url });
+    }
+    const contextText = parts.join("\n\n---\n\n");
 
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      stream: true,
+    // 4) Ask LLM (non-streaming)
+    const systemPrompt = `You are a friendly and accurate assistant for U.S. immigration questions.
+Only use the CONTEXT below for factual claims. Cite sources inline with [1], [2], etc.
+If context is insufficient, say you cannot find the answer in the provided documents. Do NOT give legal advice.
+Structure response: short direct answer, key points (bullets), next steps.`;
+    const userPrompt = `CONTEXT:
+${contextText}
+
+QUESTION:
+${userQuery}`;
+
+    // robust extraction for different SDK shapes
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
       messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt }
       ],
-      temperature: 0.1,
+      temperature: 0.15,
+      max_tokens: 800,
     });
 
-    // --- CORRECTED: Use the Vercel AI SDK's built-in data streaming ---
-    const stream = OpenAIStream(response, {
-      experimental_streamData: true,
-    });
+    // Extract text responsibly (supports several SDK response shapes)
+    let answerText = "";
+    if (completion?.choices?.[0]?.message?.content) {
+      answerText = completion.choices[0].message.content;
+    } else if (completion?.output?.[0]?.content?.[0]?.text) {
+      answerText = completion.output[0].content[0].text;
+    } else if (typeof completion === "string") {
+      answerText = completion;
+    } else {
+      // last resort: stringify entire response (for debugging)
+      answerText = JSON.stringify(completion);
+    }
 
-    const data = {
-      sources: sources,
-    };
-    
-    stream.append(data); // Append the structured sources data to the stream
-    
-    return new StreamingTextResponse(stream);
+    // 5) Return JSON with answer & structured sources
+    return res.status(200).json({
+      answer: answerText,
+      sources
+    });
 
   } catch (err) {
-    console.error('Error in handler:', err);
-    return new Response('Internal Server Error', { status: 500 });
+    console.error("API error:", err);
+    return res.status(500).json({ error: err.message || "Internal Server Error" });
   }
 }
