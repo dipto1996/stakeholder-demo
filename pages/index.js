@@ -1,156 +1,104 @@
-// pages/index.js — Frontend chat UI (onFinish parsing, link rendering)
-import { useChat } from 'ai/react';
-import { useRef, useEffect, useState } from 'react';
+// pages/index.js — simple client chat that calls /api/chat (JSON)
+import { useState, useRef, useEffect } from 'react';
 
 export default function ChatPage() {
-  const [parsedSources, setParsedSources] = useState({});
-  const [trendingTopics, setTrendingTopics] = useState([]);
+  const [messages, setMessages] = useState([]); // { id, role, content, sources? }
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef(null);
-
-  const { messages, input, setInput, handleInputChange, handleSubmit, isLoading } = useChat({
-    api: '/api/chat',
-    onFinish: (message) => {
-      // runs after the stream finished for this message (avoids race conditions)
-      const text = message.content || '';
-      const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m;
-      const match = text.match(sourcesRegex);
-      if (match && match[1]) {
-        try {
-          const parsed = JSON.parse(match[1]);
-          setParsedSources(prev => ({ ...prev, [message.id]: parsed }));
-        } catch (e) {
-          console.warn('Failed to parse SOURCES_JSON:', e);
-        }
-      }
-    }
-  });
-
-  useEffect(() => {
-    fetch('/trending.json')
-      .then(res => res.json())
-      .then(data => setTrendingTopics(data))
-      .catch(() => {});
-  }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  function stripMetadata(content) {
-    if (!content) return '';
-    return content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m, '').trim();
+  async function sendMessage(e) {
+    if (e) e.preventDefault();
+    const trimmed = (input || '').trim();
+    if (!trimmed) return;
+    const userMsg = { id: Date.now() + '_u', role: 'user', content: trimmed };
+    setMessages(prev => [...prev, userMsg]);
+    setInput('');
+    setIsLoading(true);
+
+    try {
+      const resp = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: trimmed }] })
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        const errText = data?.error || data?.message || 'Server error';
+        setMessages(prev => [...prev, { id: Date.now() + '_err', role: 'assistant', content: `Error: ${errText}` }]);
+      } else {
+        const assistantMsg = { id: Date.now() + '_a', role: 'assistant', content: data.answer || '', sources: data.sources || [] };
+        setMessages(prev => [...prev, assistantMsg]);
+      }
+    } catch (err) {
+      console.error('Fetch error:', err);
+      setMessages(prev => [...prev, { id: Date.now() + '_err2', role: 'assistant', content: 'Network error. Try again.' }]);
+    } finally {
+      setIsLoading(false);
+    }
   }
 
-  const suggestedPrompts = [
-    "What are H-1B qualifications?",
-    "What documents do I need for OPT travel?",
-    "Explain the F-1 OPT policy."
-  ];
-
-  return (
-    <div className="flex flex-col h-screen bg-neutral-50 font-sans">
-      <header className="p-4 border-b bg-white shadow-sm">
-        <h1 className="text-xl font-semibold text-neutral-900">Immigration AI Assistant</h1>
-        <p className="text-sm text-neutral-500">Informational Tool — Not Legal Advice</p>
-      </header>
-
-      <main className="flex-1 overflow-y-auto p-4">
-        <div className="space-y-4 max-w-3xl mx-auto">
-          {messages.map((msg) => {
-            const cleaned = stripMetadata(msg.content);
-            const sources = parsedSources[msg.id] || [];
-
-            return (
-              <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
-                <div className={'max-w-xl p-4 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
-                  <div className="whitespace-pre-wrap text-sm" dangerouslySetInnerHTML={{ __html: formatMarkdownSafe(cleaned) }} />
-
-                  {sources.length > 0 && (
-                    <div className="mt-3 p-3 rounded-md bg-neutral-50 border border-neutral-100">
-                      <p className="text-xs font-semibold text-neutral-600 mb-2">Sources</p>
-                      <div className="space-y-1">
-                        {sources.map(src => (
-                          <div key={src.id} className="text-xs text-neutral-600">
-                            [{src.id}] {' '}
-                            {src.url ? (
-                              <a href={src.url} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">
-                                {src.title || src.url}
-                              </a>
-                            ) : (
-                              <span className="text-neutral-700">{src.title}</span>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-          <div ref={messagesEndRef} />
-        </div>
-      </main>
-
-      <footer className="p-4 border-t bg-white">
-        <div className="max-w-3xl mx-auto">
-          {messages.length === 0 && trendingTopics.length > 0 && (
-            <div className="mb-4">
-              <h3 className="text-sm font-semibold text-neutral-700 mb-2">Trending Topics</h3>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-                {trendingTopics.map((t, i) => (
-                  <div key={i} className="p-3 bg-neutral-100 rounded-md border border-neutral-200">
-                    <p className="font-semibold text-sm text-neutral-900">{t.title}</p>
-                    <p className="text-xs text-neutral-500">{t.blurb}</p>
+  function renderMessage(m) {
+    return (
+      <div key={m.id} className={'flex ' + (m.role === 'user' ? 'justify-end' : 'justify-start')}>
+        <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (m.role === 'user' ? 'bg-blue-600 text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
+          <div style={{ whiteSpace: 'pre-wrap' }}>{m.content}</div>
+          {m.sources && m.sources.length > 0 && (
+            <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #eee', backgroundColor: '#f9fafb' }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: '#555', marginBottom: 6 }}>Sources</div>
+              <div>
+                {m.sources.map(s => (
+                  <div key={s.id} style={{ fontSize: 12, color: '#4b5563', marginBottom: 4 }}>
+                    [{s.id}] {' '}
+                    {s.url ? (
+                      <a href={s.url} target="_blank" rel="noopener noreferrer" style={{ color: '#2563eb', textDecoration: 'underline' }}>
+                        {s.title || s.url}
+                      </a>
+                    ) : (
+                      <span>{s.title}</span>
+                    )}
                   </div>
                 ))}
               </div>
             </div>
           )}
-
-          {messages.length === 0 && (
-            <div className="mb-3 flex flex-wrap gap-2">
-              {suggestedPrompts.map((p, idx) => (
-                <button key={idx} onClick={() => setInput(p)} className="px-3 py-1 bg-neutral-200 text-neutral-700 text-sm rounded-full hover:bg-neutral-300">
-                  {p}
-                </button>
-              ))}
-            </div>
-          )}
-
-          <form onSubmit={handleSubmit}>
-            <div className="flex space-x-2">
-              <input
-                value={input}
-                onChange={handleInputChange}
-                placeholder="Ask a question about U.S. immigration..."
-                className="flex-1 p-2 border border-neutral-200 rounded-md focus:ring-2 focus:ring-brand-blue focus:outline-none"
-                disabled={isLoading}
-              />
-              <button type="submit" disabled={isLoading} className="px-4 py-2 bg-brand-blue text-white font-semibold rounded-md disabled:bg-gray-400">
-                Send
-              </button>
-            </div>
-          </form>
         </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto' }}>
+      <header style={{ padding: 16, borderBottom: '1px solid #eee', background: '#fff' }}>
+        <h1 style={{ margin: 0 }}>Immigration AI Assistant</h1>
+        <div style={{ fontSize: 12, color: '#6b7280' }}>Informational — not legal advice</div>
+      </header>
+
+      <main style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, maxWidth: 800, margin: '0 auto' }}>
+          {messages.map(renderMessage)}
+          <div ref={messagesEndRef} />
+        </div>
+      </main>
+
+      <footer style={{ padding: 16, borderTop: '1px solid #eee', background: '#fff' }}>
+        <form onSubmit={sendMessage} style={{ maxWidth: 800, margin: '0 auto', display: 'flex', gap: 8 }}>
+          <input
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            placeholder="Ask a question about U.S. immigration..."
+            disabled={isLoading}
+            style={{ flex: 1, padding: '10px 12px', border: '1px solid #e5e7eb', borderRadius: 8 }}
+          />
+          <button type="submit" disabled={isLoading} style={{ padding: '10px 16px', background: isLoading ? '#9ca3af' : '#2563eb', color: '#fff', borderRadius: 8, border: 'none' }}>
+            {isLoading ? 'Thinking...' : 'Send'}
+          </button>
+        </form>
       </footer>
     </div>
   );
-}
-
-function formatMarkdownSafe(text) {
-  if (!text) return '';
-  const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
-  const lines = esc(text).split('\n');
-  const out = [];
-  for (const line of lines) {
-    if (line.trim().startsWith('- ')) {
-      out.push(`<li>${line.trim().slice(2)}</li>`);
-    } else {
-      const bolded = line.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-      out.push(`<p>${bolded}</p>`);
-    }
-  }
-  const html = out.join('');
-  return html.replace(/(<li>.*?<\/li>)+/gs, (m) => `<ul class="ml-4 list-disc">${m}</ul>`);
 }
