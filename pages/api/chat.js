@@ -1,4 +1,4 @@
-// chat.js — Final, Stable Version with Citations + Greetings
+// /pages/api/chat.js
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
 import { sql } from '@vercel/postgres';
@@ -6,18 +6,18 @@ import { sql } from '@vercel/postgres';
 export const config = { runtime: 'edge' };
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 const EMBEDDING_MODEL = 'text-embedding-3-small';
 const CHAT_MODEL = 'gpt-4o-mini';
-const MAX_EXCERPT = 1600;
-const MAX_CONTEXT_TOTAL = 6000;
 
-// --- Helpers ---
-async function embed(text) {
-  const res = await openai.embeddings.create({ model: EMBEDDING_MODEL, input: text });
-  return res.data[0].embedding;
+async function getEmbedding(text) {
+  const resp = await openai.embeddings.create({
+    model: EMBEDDING_MODEL,
+    input: text,
+  });
+  return resp.data[0].embedding;
 }
 
-// --- Handler ---
 export default async function handler(req) {
   if (req.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 });
@@ -25,78 +25,68 @@ export default async function handler(req) {
 
   try {
     const { messages } = await req.json();
-    const userQuery = (messages?.at(-1)?.content || '').trim();
+    const userQuery = (messages[messages.length - 1].content || '').trim();
     if (!userQuery) return new Response('Empty query', { status: 400 });
 
-    // Greeting shortcut
+    // Shortcut for greetings
     if (/^(hi|hello|hey)\b/i.test(userQuery)) {
       const s = new ReadableStream({
         start(c) {
-          c.enqueue(new TextEncoder().encode("Hello! 👋 How can I help with your U.S. immigration questions?"));
+          c.enqueue(new TextEncoder().encode("Hello 👋 How can I help with U.S. immigration?"));
           c.close();
         }
       });
       return new StreamingTextResponse(s);
     }
 
-    // Embedding + retrieval
-    const emb = await embed(userQuery);
+    // 1. Get embedding
+    const queryEmbedding = await getEmbedding(userQuery);
+
+    // 2. Query database for top docs
     const { rows } = await sql`
       SELECT source_title, source_url, content
       FROM documents
-      ORDER BY embedding <=> ${JSON.stringify(emb)}::vector
+      ORDER BY embedding <=> ${JSON.stringify(queryEmbedding)}::vector
       LIMIT 5
     `;
 
-    if (!rows?.length) {
+    if (!rows || rows.length === 0) {
       const s = new ReadableStream({
         start(c) {
-          c.enqueue(new TextEncoder().encode("I couldn’t find supporting sources in the database."));
+          c.enqueue(new TextEncoder().encode("I couldn’t find supporting documents in the sources I know."));
           c.close();
         }
       });
       return new StreamingTextResponse(s);
     }
 
-    // Build sources metadata
+    // Build sources block
     const sources = rows.map((r, i) => ({
       id: i + 1,
-      title: r.source_title || "Untitled Source",
-      url: r.source_url || null,
+      title: r.source_title || "Untitled",
+      url: r.source_url,
     }));
 
-    // Context
-    let chars = 0;
-    const parts = [];
-    for (let i = 0; i < rows.length; i++) {
-      const excerpt = (rows[i].content || '').slice(0, MAX_EXCERPT);
-      if (chars + excerpt.length > MAX_CONTEXT_TOTAL) break;
-      parts.push(`[${i + 1}] ${excerpt}`);
-      chars += excerpt.length;
-    }
+    // Build context
+    const context = rows.map((r, i) => `[${i + 1}] ${r.content.slice(0, 800)}`).join("\n\n");
 
-    const context = parts.join("\n\n---\n\n");
-    const sysPrompt = `
-You are a careful assistant for U.S. immigration.
-Use ONLY the CONTEXT below. Always cite with [1], [2], etc.
-Answer with: 
-1) Short direct answer 
-2) Key points (bullets) 
-3) Next steps
-Do not provide legal advice.
-    `;
+    const systemPrompt = `You are a careful AI for U.S. immigration questions.
+Always cite sources using [1], [2], etc. Do not hallucinate.
+Keep answers short, structured, and do not give legal advice.`;
+
+    const userPrompt = `CONTEXT:\n${context}\n\nQUESTION:\n${userQuery}`;
 
     const completion = await openai.chat.completions.create({
       model: CHAT_MODEL,
       stream: true,
+      temperature: 0.15,
       messages: [
-        { role: 'system', content: sysPrompt },
-        { role: 'user', content: `CONTEXT:\n${context}\n\nQUESTION:\n${userQuery}` }
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
       ],
-      temperature: 0.2,
     });
 
-    // Prepend sources JSON
+    // Send sources first so frontend can parse them
     const preamble = `SOURCES_JSON:${JSON.stringify(sources)}\n\n`;
     const encoded = new TextEncoder().encode(preamble);
     const stream = OpenAIStream(completion);
@@ -117,7 +107,7 @@ Do not provide legal advice.
     return new StreamingTextResponse(combined);
 
   } catch (err) {
-    console.error("chat.js error", err);
-    return new Response("Server error", { status: 500 });
+    console.error(err);
+    return new Response('Internal Server Error', { status: 500 });
   }
 }
