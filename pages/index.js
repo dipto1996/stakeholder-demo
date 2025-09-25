@@ -3,100 +3,75 @@ import { useChat } from 'ai/react';
 import { useRef, useEffect, useState } from 'react';
 
 export default function ChatPage() {
+  // store parsed metadata keyed by assistant message id
   const [parsedSources, setParsedSources] = useState({});
+  const [parsedSuggested, setParsedSuggested] = useState({});
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
-  // Note: useChat must be called after hooks (we keep it simple)
+  // useChat must be declared after hooks
   const { messages, input, setInput, handleInputChange, handleSubmit, isLoading, append } = useChat({
-    api: '/api/chat' // streaming endpoint (must be a pure model stream)
+    api: '/api/chat',
+    // onFinish fires after streaming completes and message is persisted
+    onFinish: (message) => {
+      if (!message || !message.content) return;
+      // non-greedy JSON capture for SOURCES_JSON at start
+      const sourcesRegex = /^SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/;
+      const suggestedRegex = /SUGGESTED:\s*(\[[\s\S]*?\])\s*$/m;
+
+      const sMatch = message.content.match(sourcesRegex);
+      if (sMatch && sMatch[1]) {
+        try {
+          const parsed = JSON.parse(sMatch[1]);
+          setParsedSources(prev => ({ ...prev, [message.id]: parsed }));
+        } catch (e) {
+          console.warn('Failed to parse SOURCES_JSON', e);
+        }
+      }
+
+      const sugMatch = message.content.match(suggestedRegex);
+      if (sugMatch && sugMatch[1]) {
+        try {
+          const parsed = JSON.parse(sugMatch[1]);
+          setParsedSuggested(prev => ({ ...prev, [message.id]: parsed }));
+        } catch (e) {
+          console.warn('Failed to parse SUGGESTED', e);
+        }
+      }
+    }
   });
 
-  // Fetch trending topics on mount
   useEffect(() => {
     fetch('/trending.json')
-      .then(res => res.json())
+      .then(r => r.json())
       .then(data => setTrendingTopics(data))
       .catch(() => {});
   }, []);
 
-  // autoscroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Parse metadata (SOURCES_JSON) after message finalizes
-  useEffect(() => {
-    if (!messages || messages.length === 0) return;
-    const last = messages[messages.length - 1];
-    if (last.role !== 'assistant' || !last.content) return;
-
-    // look for a SOURCES_JSON preamble in the assistant message content
-    const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/;
-    const match = last.content.match(sourcesRegex);
-    if (match && match[1]) {
-      try {
-        const parsed = JSON.parse(match[1]);
-        setParsedSources(prev => ({ ...prev, [last.id]: parsed }));
-      } catch (e) {
-        console.warn('Failed to parse SOURCES_JSON', e);
-      }
-    }
-  }, [messages]);
-
-  // Strip the SOURCES preamble when displaying messages
-  function stripPreamble(content = '') {
-    return content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/, '').trim();
+  // remove SOURCES_JSON preamble and SUGGESTED line for display
+  function stripMetadata(content = '') {
+    if (!content) return '';
+    // strip preamble at start
+    content = content.replace(/^SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/, '');
+    // strip trailing suggested JSON line
+    content = content.replace(/\n?SUGGESTED:\s*(\[[\s\S]*?\])\s*$/m, '');
+    return content.trim();
   }
 
-  // NEW: wrapper submit that first requests sources (fast), then triggers handleSubmit for streaming
-  async function submitWrapper(e) {
-    e.preventDefault();
-    const userText = (input || '').trim();
-    if (!userText) return;
-
-    // 1) Optimistically append user's message so UI updates immediately
-    // append will add a user message to messages array (useChat)
-    append({ role: 'user', content: userText });
-    setInput(''); // clear input immediately
-
-    // 2) Request citations/sources first
-    try {
-      // send minimal body to chat-sources; adapt to whatever your endpoint expects
-      const srcResp = await fetch('/api/chat-sources', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: [{ role: 'user', content: userText }] })
-      });
-      // We do not require the sources to proceed; but store them for later display
-      if (srcResp.ok) {
-        const data = await srcResp.json();
-        // store under a temporary key so you can show them once assistant arrives
-        // data.sources expected to be [{ id, title, url, excerpt }, ...]
-        // we won't render them now; we'll attach to the assistant message when it arrives
-        // Save under a "pending" key (use timestamp)
-        const pendingKey = `pending-${Date.now()}`;
-        setParsedSources(prev => ({ ...prev, [pendingKey]: data.sources }));
-        // Optionally pass this pendingKey to your chat endpoint via hidden field or cookie (not required)
-      } else {
-        console.warn('chat-sources returned non-200', await srcResp.text());
-      }
-    } catch (err) {
-      console.warn('chat-sources fetch failed', err);
-    }
-
-    // 3) Trigger streaming LLM call using useChat's handler (this posts to /api/chat and streams)
-    // Important: let useChat do its normal streaming flow so the frontend receives partial tokens
-    // Call handleSubmit with a synthetic event so useChat behaves normally
-    // Since we've already appended the user message, pass empty input so useChat won't duplicate it
-    // Some versions of useChat rely on the form event to gather the input; the easiest is to call handleSubmit directly:
-    // Create a fake event object with preventDefault to satisfy handleSubmit signature
-    const fakeEvent = { preventDefault() {} };
-    // For safety, wait a tick so UI has appended the user message
-    setTimeout(() => {
-      handleSubmit(fakeEvent);
-    }, 50);
+  function handleSuggestedClick(prompt) {
+    // append the user message and submit quickly
+    append({ role: 'user', content: prompt });
   }
+
+  const defaultSuggestedPrompts = [
+    "What are H-1B qualifications?",
+    "What documents do I need for OPT travel?",
+    "Explain the F-1 OPT policy.",
+  ];
 
   return (
     <div className="flex flex-col h-screen bg-neutral-50 font-sans">
@@ -107,9 +82,11 @@ export default function ChatPage() {
 
       <main className="flex-1 overflow-y-auto p-4">
         <div className="space-y-4 max-w-3xl mx-auto">
-          {messages.map(msg => {
-            const cleaned = stripPreamble(msg.content || '');
-            const sources = parsedSources[msg.id] || null;
+          {messages.map((msg) => {
+            const sources = parsedSources[msg.id];
+            const suggested = parsedSuggested[msg.id];
+            const cleaned = stripMetadata(msg.content);
+
             return (
               <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
                 <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
@@ -117,17 +94,32 @@ export default function ChatPage() {
 
                   {sources && sources.length > 0 && (
                     <div className="mt-2 border-t border-neutral-200 pt-2">
-                      <p className="text-xs font-semibold text-neutral-600 mb-1">Sources:</p>
+                      <p className="text-xs font-semibold text-neutral-600 mb-1">Sources</p>
                       <div className="space-y-1">
-                        {sources.map(s => (
-                          <div key={s.id} className="text-xs text-neutral-500">
-                            [{s.id}] {' '}
-                            {s.url ? (
-                              <a href={s.url} target="_blank" rel="noreferrer" className="underline hover:text-brand-blue">{s.title || s.url}</a>
+                        {sources.map(source => (
+                          <div key={source.id} className="text-xs text-neutral-500">
+                            [{source.id}] {' '}
+                            {source.url ? (
+                              <a href={source.url} target="_blank" rel="noopener noreferrer" className="underline hover:text-brand-blue">
+                                {source.title || source.url}
+                              </a>
                             ) : (
-                              s.title || s.url || 'Untitled Source'
+                              <span>{source.title || 'Untitled Source'}</span>
                             )}
                           </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {suggested && Array.isArray(suggested) && suggested.length > 0 && (
+                    <div className="mt-2 pt-2">
+                      <p className="text-xs font-semibold text-neutral-600 mb-1">Suggested Follow-ups</p>
+                      <div className="flex flex-wrap gap-2">
+                        {suggested.map((s, i) => (
+                          <button key={i} onClick={() => handleSuggestedClick(s)} className="px-3 py-1 bg-neutral-200 text-neutral-700 text-sm rounded-full hover:bg-neutral-300 transition-colors">
+                            {s}
+                          </button>
                         ))}
                       </div>
                     </div>
@@ -146,8 +138,8 @@ export default function ChatPage() {
             <div className="mb-4">
               <h3 className="text-sm font-semibold text-neutral-700 mb-2">Trending Topics</h3>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-                {trendingTopics.map((topic, index) => (
-                  <div key={index} className="p-3 bg-neutral-100 rounded-md border border-neutral-200">
+                {trendingTopics.map((topic, idx) => (
+                  <div key={idx} className="p-3 bg-neutral-100 rounded-md border border-neutral-200">
                     <p className="font-semibold text-sm text-neutral-900">{topic.title}</p>
                     <p className="text-xs text-neutral-500">{topic.blurb}</p>
                   </div>
@@ -156,7 +148,17 @@ export default function ChatPage() {
             </div>
           )}
 
-          <form onSubmit={submitWrapper}>
+          {messages.length === 0 && (
+            <div className="mb-3 flex flex-wrap gap-2">
+              {defaultSuggestedPrompts.map((prompt, index) => (
+                <button key={index} onClick={() => setInput(prompt)} className="px-3 py-1 bg-neutral-200 text-neutral-700 text-sm rounded-full hover:bg-neutral-300 transition-colors">
+                  {prompt}
+                </button>
+              ))}
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit}>
             <div className="flex space-x-2">
               <input
                 value={input}
@@ -165,8 +167,12 @@ export default function ChatPage() {
                 className="flex-1 p-2 border border-neutral-200 rounded-md focus:ring-2 focus:ring-brand-blue focus:outline-none"
                 disabled={isLoading}
               />
-              <button type="submit" disabled={isLoading} className="px-4 py-2 bg-brand-blue text-white font-semibold rounded-md disabled:bg-gray-400 hover:bg-blue-600">
-                Send
+              <button
+                type="submit"
+                disabled={isLoading}
+                className="px-4 py-2 bg-brand-blue text-white font-semibold rounded-md disabled:bg-gray-400 hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-brand-blue transition-colors"
+              >
+                {isLoading ? 'Thinking…' : 'Send'}
               </button>
             </div>
           </form>
