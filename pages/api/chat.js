@@ -1,32 +1,28 @@
-// chat.js — Final Production-Grade Version
-// This version is compatible with the new database schema and the intelligent frontend.
-// It retrieves rich citation data (title and URL) and sends it to the client.
+// pages/api/chat.js
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
 import { sql } from '@vercel/postgres';
 
-// This is the critical line that tells Vercel to use the correct, high-performance environment
 export const config = { runtime: 'edge' };
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --- Configuration ---
+// Tunables
 const EMBEDDING_MODEL = 'text-embedding-3-small';
 const CHAT_MODEL = 'gpt-4o-mini';
 const EMB_RETRIES = 3;
 const CHAT_RETRIES = 2;
-const MAX_EXCERPT_LENGTH = 1600; 
-const MAX_CONTEXT_LENGTH = 6000;
+const MAX_EXCERPT_LENGTH = 1600; // characters per excerpt
+const MAX_CONTEXT_LENGTH = 6000;  // total characters of context
 
-// --- Helper Functions ---
-async function createEmbeddingsWithRetry(input) {
+async function createEmbeddingsWithRetry(text) {
   for (let attempt = 0; attempt < EMB_RETRIES; attempt++) {
     try {
-      const response = await openai.embeddings.create({ model: EMBEDDING_MODEL, input });
-      if (!response?.data?.[0]?.embedding) throw new Error("Embedding API returned no embedding.");
-      return response;
-    } catch (e) {
-      if (attempt === EMB_RETRIES - 1) throw e;
+      const resp = await openai.embeddings.create({ model: EMBEDDING_MODEL, input: text });
+      if (!resp?.data?.[0]?.embedding) throw new Error('No embedding returned');
+      return resp;
+    } catch (err) {
+      if (attempt === EMB_RETRIES - 1) throw err;
       await new Promise(r => setTimeout(r, 2 ** attempt * 1000));
     }
   }
@@ -41,77 +37,88 @@ async function createCompletionWithRetry(messages) {
         messages,
         temperature: 0.15,
       });
-    } catch (e) {
-      if (attempt === CHAT_RETRIES - 1) throw e;
+    } catch (err) {
+      if (attempt === CHAT_RETRIES - 1) throw err;
       await new Promise(r => setTimeout(r, 2 ** attempt * 1000));
     }
   }
 }
 
-// --- Main API Handler ---
 export default async function handler(req) {
   if (req.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 });
   }
 
   try {
-    const { messages } = await req.json();
+    const body = await req.json();
+    const { messages } = body || {};
     if (!Array.isArray(messages) || messages.length === 0) {
       return new Response('Invalid request body', { status: 400 });
     }
+
     const userQuery = (messages[messages.length - 1].content || '').trim();
     if (!userQuery) return new Response('Empty user query', { status: 400 });
 
-    const GREETING_RE = /^(hi|hello|hey)\b/i;
+    // Quick greeting shortcut (fast, avoids embeddings/cost)
+    const GREETING_RE = /^(hi|hello|hey|good morning|good afternoon|good evening)[!.]?\s*$/i;
     if (GREETING_RE.test(userQuery)) {
-      const greetingStream = new ReadableStream({
+      const greeting = "Hello! 👋 I can help explain U.S. immigration topics (H-1B, F-1, OPT, CPT). What would you like to know?";
+      const s = new ReadableStream({
         start(controller) {
-          controller.enqueue(new TextEncoder().encode("Hello! How can I help with your U.S. immigration questions?"));
+          controller.enqueue(new TextEncoder().encode(greeting));
           controller.close();
         }
       });
-      return new StreamingTextResponse(greetingStream);
+      return new StreamingTextResponse(s);
     }
 
+    // 1) Embedding (retry)
     const embResp = await createEmbeddingsWithRetry(userQuery);
     const queryEmbedding = embResp.data[0].embedding;
+    const embLiteral = JSON.stringify(queryEmbedding);
 
-    // CORRECTED: Query now includes the new citation columns
-    const { rows } = await sql`
-        SELECT source_title, source_url, content 
-        FROM documents 
-        ORDER BY embedding <=> ${JSON.stringify(queryEmbedding)}::vector
-        LIMIT 5
+    // 2) Retrieve top-k relevant documents from Neon/Postgres via @vercel/postgres
+    // Note: cast to ::vector in SQL; @vercel/postgres will substitute our embLiteral string safely
+    const q = await sql`
+      SELECT source_title, source_url, content
+      FROM documents
+      ORDER BY embedding <=> ${embLiteral}::vector
+      LIMIT 6
     `;
+    const rows = q?.rows ?? [];
 
+    // 3) No results fallback
     if (!rows || rows.length === 0) {
-      const fallbackStream = new ReadableStream({
+      const fallback = "I couldn't find supporting documents in our indexed sources for that question. Would you like (A) a broader search, (B) general guidance, or (C) lawyer review?";
+      const s = new ReadableStream({
         start(controller) {
-          controller.enqueue(new TextEncoder().encode("I couldn't find supporting documents in our indexed sources for that question."));
+          controller.enqueue(new TextEncoder().encode(fallback));
           controller.close();
         }
       });
-      return new StreamingTextResponse(fallbackStream);
+      return new StreamingTextResponse(s);
     }
 
-    // CORRECTED: Build the sources object with the new data
+    // 4) Build trimmed context and sources list (respect budgets)
     const sources = rows.map((r, i) => ({
       id: i + 1,
-      title: r.source_title || "Untitled Source",
-      url: r.source_url,
+      title: r.source_title || `Source ${i + 1}`,
+      url: r.source_url || null,
     }));
-    
+
     let totalChars = 0;
     const contextParts = [];
     for (let i = 0; i < rows.length; i++) {
       const excerpt = (rows[i].content || '').slice(0, MAX_EXCERPT_LENGTH);
       if (totalChars + excerpt.length > MAX_CONTEXT_LENGTH) break;
-      contextParts.push(`[${i + 1}] source_title: ${rows[i].source_title}\ncontent: ${excerpt}`);
+      contextParts.push(`[${i + 1}] title: ${rows[i].source_title || `source_${i+1}`}\ncontent: ${excerpt}`);
       totalChars += excerpt.length;
     }
     const contextText = contextParts.join('\n\n---\n\n');
-    
-    const systemPrompt = `You are a friendly and professional AI assistant for U.S. immigration questions. Use ONLY the numbered sources in the CONTEXT section below to answer the user's QUESTION. You must cite your sources for every factual claim you make using the format [1], [2], etc. Your response should be structured with a short direct answer, followed by key points in a bulleted list, and finally a list of next steps. Do NOT provide legal advice. If the context is insufficient, state that you cannot find the answer in the provided documents.`;
+
+    // 5) System + user prompt (conversational + citation instructions)
+    const systemPrompt = `You are a friendly, careful AI assistant for U.S. immigration questions. Use ONLY the provided CONTEXT / SOURCES for factual claims. Cite facts with bracketed numbers like [1], [2] that map to the SOURCES block. Provide a short direct answer, then key points (bullet list), then next steps. Do NOT provide legal advice. If the context is insufficient, say you couldn't find the answer in the provided documents. At the end, output a machine-parsable SUGGESTED line: SUGGESTED: ["followup 1","followup 2"]`;
+
     const userPrompt = `CONTEXT:\n${contextText}\n\nQUESTION:\n${userQuery}`;
 
     const messagesForModel = [
@@ -119,15 +126,17 @@ export default async function handler(req) {
       { role: 'user', content: userPrompt }
     ];
 
+    // 6) Call chat completion (streaming) with retry
     const completion = await createCompletionWithRetry(messagesForModel);
 
-    // CORRECTED: Send the rich sources object in the preamble
+    // 7) Build preamble with sources and stream combined output
     const preamble = `SOURCES_JSON:${JSON.stringify(sources)}\n\n`;
     const encodedPreamble = new TextEncoder().encode(preamble);
     const modelStream = OpenAIStream(completion);
-    
-    const combinedStream = new ReadableStream({
+
+    const combined = new ReadableStream({
       async start(controller) {
+        // send preamble then model stream
         controller.enqueue(encodedPreamble);
         const reader = modelStream.getReader();
         while (true) {
@@ -139,10 +148,10 @@ export default async function handler(req) {
       }
     });
 
-    return new StreamingTextResponse(combinedStream);
+    return new StreamingTextResponse(combined);
 
   } catch (err) {
-    console.error('Error in handler:', err);
+    console.error('chat handler error:', err);
     return new Response('Internal Server Error', { status: 500 });
   }
 }
