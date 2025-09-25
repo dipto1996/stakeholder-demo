@@ -1,56 +1,54 @@
-// pages/index.js — Final frontend (useChat with onFinish metadata parsing)
+// index.js — Final, Corrected Version
+// This version moves the parsing logic directly into the render function
+// to prevent state conflicts with the `useChat` hook, fixing the silent render failure.
 import { useChat } from 'ai/react';
 import { useRef, useEffect, useState } from 'react';
 
 export default function ChatPage() {
-  // parsed sources map: messageId -> sources array
-  const [parsedSources, setParsedSources] = useState({});
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
-  // must declare state hooks before useChat
   const { messages, input, setInput, handleInputChange, handleSubmit, isLoading } = useChat({
     api: '/api/chat',
-    onFinish: (message) => {
-      // tolerant regex that matches the last SOURCES_JSON block (end of string)
-      const text = message.content || '';
-      const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m;
-      const match = text.match(sourcesRegex);
-      if (match && match[1]) {
-        try {
-          const parsed = JSON.parse(match[1]);
-          setParsedSources(prev => ({ ...prev, [message.id]: parsed }));
-        } catch (e) {
-          console.warn('Failed to parse SOURCES_JSON for message', message.id, e);
-        }
-      }
-    }
   });
 
-  // trending topics (unchanged)
+  // Fetch trending topics on component mount
   useEffect(() => {
     fetch('/trending.json')
       .then(res => res.json())
       .then(data => setTrendingTopics(data))
-      .catch(() => {});
+      .catch(err => console.error("Failed to fetch trending topics:", err));
   }, []);
 
-  // auto-scroll
+  // Auto-scroll to the latest message
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // strip trailing metadata (SOURCES_JSON) for UI display
+  // Helper to safely parse sources from a message's content
+  const parseSources = (content) => {
+    const sourcesRegex = /^SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/;
+    const sourcesMatch = content.match(sourcesRegex);
+    if (sourcesMatch && sourcesMatch[1]) {
+      try {
+        return JSON.parse(sourcesMatch[1]);
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  };
+
+  // Helper to safely remove the metadata preamble from displayed content
   function stripMetadata(content) {
     if (!content) return '';
-    // remove only the final SOURCES_JSON block (space tolerant)
-    return content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m, '').trim();
+    return content.replace(/^SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/, '').trim();
   }
 
   const defaultSuggestedPrompts = [
     "What are H-1B qualifications?",
     "What documents do I need for OPT travel?",
-    "Explain the F-1 OPT policy.",
+    "Explain F-1 OPT policy.",
   ];
 
   return (
@@ -63,8 +61,9 @@ export default function ChatPage() {
       <main className="flex-1 overflow-y-auto p-4">
         <div className="space-y-4 max-w-3xl mx-auto">
           {messages.map((msg) => {
+            // Perform parsing directly here inside the render loop
+            const sources = msg.role === 'assistant' ? parseSources(msg.content) : null;
             const cleanedContent = stripMetadata(msg.content);
-            const sources = parsedSources[msg.id];
 
             return (
               <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
@@ -80,10 +79,10 @@ export default function ChatPage() {
                             [{source.id}] {' '}
                             {source.url ? (
                               <a href={source.url} target="_blank" rel="noopener noreferrer" className="underline hover:text-brand-blue">
-                                {source.title || source.url}
+                                {source.title}
                               </a>
                             ) : (
-                              source.title || 'Untitled source'
+                              source.title
                             )}
                           </div>
                         ))}
