@@ -1,25 +1,24 @@
-// index.js — Final, Corrected Version
-// This version uses the `onFinish` callback to reliably parse metadata
-// after the stream is complete, fixing the silent render failure.
+// pages/index.js — Final frontend (useChat with onFinish metadata parsing)
 import { useChat } from 'ai/react';
 import { useRef, useEffect, useState } from 'react';
 
 export default function ChatPage() {
+  // parsed sources map: messageId -> sources array
   const [parsedSources, setParsedSources] = useState({});
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
+  // must declare state hooks before useChat
   const { messages, input, setInput, handleInputChange, handleSubmit, isLoading } = useChat({
     api: '/api/chat',
-    // Use onFinish to parse metadata after the stream is complete
     onFinish: (message) => {
+      // tolerant regex that matches the last SOURCES_JSON block (end of string)
       const text = message.content || '';
-      // CORRECTED: Use a more robust, multi-line regex
       const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m;
-      const sourcesMatch = text.match(sourcesRegex);
-      if (sourcesMatch && sourcesMatch[1]) {
+      const match = text.match(sourcesRegex);
+      if (match && match[1]) {
         try {
-          const parsed = JSON.parse(sourcesMatch[1]);
+          const parsed = JSON.parse(match[1]);
           setParsedSources(prev => ({ ...prev, [message.id]: parsed }));
         } catch (e) {
           console.warn('Failed to parse SOURCES_JSON for message', message.id, e);
@@ -28,30 +27,30 @@ export default function ChatPage() {
     }
   });
 
-  // Fetch trending topics on component mount
+  // trending topics (unchanged)
   useEffect(() => {
     fetch('/trending.json')
       .then(res => res.json())
       .then(data => setTrendingTopics(data))
-      .catch(err => console.error("Failed to fetch trending topics:", err));
+      .catch(() => {});
   }, []);
 
-  // Auto-scroll to the latest message
+  // auto-scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Helper to safely remove the metadata preamble from displayed content
+  // strip trailing metadata (SOURCES_JSON) for UI display
   function stripMetadata(content) {
     if (!content) return '';
-    // CORRECTED: Use a more robust, multi-line regex
+    // remove only the final SOURCES_JSON block (space tolerant)
     return content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m, '').trim();
   }
 
   const defaultSuggestedPrompts = [
     "What are H-1B qualifications?",
     "What documents do I need for OPT travel?",
-    "Explain F-1 OPT policy.",
+    "Explain the F-1 OPT policy.",
   ];
 
   return (
@@ -81,10 +80,10 @@ export default function ChatPage() {
                             [{source.id}] {' '}
                             {source.url ? (
                               <a href={source.url} target="_blank" rel="noopener noreferrer" className="underline hover:text-brand-blue">
-                                {source.title}
+                                {source.title || source.url}
                               </a>
                             ) : (
-                              source.title
+                              source.title || 'Untitled source'
                             )}
                           </div>
                         ))}
