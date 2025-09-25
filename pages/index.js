@@ -1,66 +1,55 @@
 // pages/index.js
-import { useState, useRef, useEffect } from "react";
+import { useChat } from 'ai/react';
+import { useRef, useEffect, useState } from 'react';
 
 export default function ChatPage() {
-  const [messages, setMessages] = useState([]); // { role: 'user'|'assistant', content, sources? }
-  const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
-  const endRef = useRef(null);
+  const [trendingTopics, setTrendingTopics] = useState([]);
+  const messagesEndRef = useRef(null);
+
+  // IMPORTANT: `data` is the per-message metadata array from useChat (keeps sync with messages)
+  // Make sure your ai/react version supports returning `data` for messages.
+  const {
+    messages,
+    input,
+    setInput,
+    handleInputChange,
+    handleSubmit,
+    isLoading,
+    data, // <-- metadata array aligned with messages
+  } = useChat({
+    api: '/api/chat',
+  });
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    fetch('/trending.json')
+      .then(res => res.json())
+      .then(d => setTrendingTopics(d))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  async function handleSubmit(e) {
-    e?.preventDefault();
-    const text = (input || "").trim();
-    if (!text) return;
-    // append user message immediately
-    const userMsg = { role: "user", content: text };
-    setMessages((m) => [...m, userMsg]);
-    setInput("");
-    setLoading(true);
-
-    try {
-      const resp = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: [{ role: "user", content: text }] }),
-      });
-
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ error: "Unknown" }));
-        throw new Error(err.error || `Status ${resp.status}`);
-      }
-
-      const data = await resp.json();
-      // data: { answer: string, sources: [{id,title,url}] }
-      const assistantMsg = { role: "assistant", content: data.answer || "No answer", sources: data.sources || [] };
-      setMessages((m) => [...m, assistantMsg]);
-    } catch (e) {
-      console.error("chat error:", e);
-      setMessages((m) => [...m, { role: "assistant", content: "Sorry — something went wrong." }]);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // Presentational helpers
-  function renderSources(sources = []) {
+  function renderSourcesForIndex(idx) {
+    // data is aligned with messages; each entry may be undefined or contain { sources: [...] }
+    const meta = data?.[idx];
+    const sources = meta?.sources ?? [];
     if (!sources || sources.length === 0) return null;
+
     return (
-      <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid #eee", background: "#f7fbff" }}>
-        <div style={{ fontSize: 12, color: "#556", marginBottom: 6, fontWeight: 600 }}>Sources</div>
-        <div>
-          {sources.map((s) => (
-            <div key={s.id} style={{ fontSize: 13, color: "#1558d6", marginBottom: 4 }}>
-              [{s.id}]{" "}
-              {s.url ? (
-                <a href={s.url} target="_blank" rel="noopener noreferrer" style={{ color: "#1558d6", textDecoration: "underline" }}>
-                  {s.title || s.url}
+      <div className="mt-2 border-t border-neutral-200 pt-2 bg-neutral-50 px-2 py-1 rounded">
+        <p className="text-xs font-semibold text-neutral-600 mb-1">Sources</p>
+        <div className="space-y-1">
+          {sources.map(src => (
+            <div key={src.id} className="text-xs text-neutral-700">
+              [{src.id}] {' '}
+              {src.url ? (
+                <a href={src.url} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">
+                  {src.title}
                 </a>
               ) : (
-                <span style={{ color: "#333" }}>{s.title}</span>
+                <span className="text-neutral-700">{src.title}</span>
               )}
             </div>
           ))}
@@ -69,48 +58,64 @@ export default function ChatPage() {
     );
   }
 
+  const suggestedPrompts = [
+    "What are H-1B qualifications?",
+    "Explain OPT travel rules.",
+    "How do I apply for a green card?"
+  ];
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100vh", fontFamily: "Inter, sans-serif" }}>
-      <header style={{ padding: 16, borderBottom: "1px solid #eee", background: "#fff" }}>
-        <h2 style={{ margin: 0 }}>Immigration AI Assistant</h2>
-        <div style={{ color: "#666", fontSize: 13 }}>Informational only — not legal advice</div>
+    <div className="flex flex-col h-screen bg-neutral-50 font-sans">
+      <header className="p-4 border-b bg-white shadow-sm">
+        <h1 className="text-xl font-semibold text-neutral-900">Immigration AI Assistant</h1>
+        <p className="text-sm text-neutral-500">Informational Tool - Not Legal Advice</p>
       </header>
 
-      <main style={{ flex: 1, overflow: "auto", padding: 20 }}>
-        <div style={{ maxWidth: 900, margin: "0 auto" }}>
-          {messages.map((m, idx) => (
-            <div key={idx} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start", marginBottom: 12 }}>
-              <div style={{
-                maxWidth: "75%",
-                padding: 12,
-                borderRadius: 8,
-                background: m.role === "user" ? "#0b63d8" : "#fff",
-                color: m.role === "user" ? "#fff" : "#111",
-                boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
-                border: m.role === "assistant" ? "1px solid #eee" : "none"
-              }}>
-                <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.45 }}>{m.content}</div>
-                {m.role === "assistant" && renderSources(m.sources)}
+      <main className="flex-1 overflow-y-auto p-4">
+        <div className="space-y-4 max-w-3xl mx-auto">
+          {messages.map((msg, i) => (
+            <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
+              <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
+                <p className="whitespace-pre-wrap text-sm">{msg.content}</p>
+                {renderSourcesForIndex(i)}
               </div>
             </div>
           ))}
-          <div ref={endRef} />
+          <div ref={messagesEndRef} />
         </div>
       </main>
 
-      <footer style={{ padding: 16, borderTop: "1px solid #eee", background: "#fff" }}>
-        <form onSubmit={handleSubmit} style={{ maxWidth: 900, margin: "0 auto", display: "flex", gap: 8 }}>
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask a question about U.S. immigration..."
-            style={{ flex: 1, padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd" }}
-            disabled={loading}
-          />
-          <button type="submit" disabled={loading} style={{ padding: "10px 14px", borderRadius: 8, background: "#0b63d8", color: "#fff", border: "none" }}>
-            {loading ? "Thinking..." : "Send"}
-          </button>
-        </form>
+      <footer className="p-4 border-t bg-white">
+        <div className="max-w-3xl mx-auto">
+          {messages.length === 0 && (
+            <div className="mb-4 grid grid-cols-1 md:grid-cols-3 gap-2">
+              {suggestedPrompts.map((s, idx) => (
+                <button key={idx} onClick={() => setInput(s)} className="px-3 py-2 bg-neutral-100 rounded-md text-sm">
+                  {s}
+                </button>
+              ))}
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit}>
+            <div className="flex space-x-2">
+              <input
+                value={input}
+                onChange={handleInputChange}
+                placeholder="Ask a question about U.S. immigration..."
+                className="flex-1 p-2 border border-neutral-200 rounded-md focus:ring-2 focus:ring-brand-blue focus:outline-none"
+                disabled={isLoading}
+              />
+              <button
+                type="submit"
+                disabled={isLoading}
+                className="px-4 py-2 bg-brand-blue text-white font-semibold rounded-md disabled:bg-gray-400 hover:bg-blue-600"
+              >
+                {isLoading ? 'Thinking…' : 'Send'}
+              </button>
+            </div>
+          </form>
+        </div>
       </footer>
     </div>
   );
