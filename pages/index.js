@@ -3,22 +3,34 @@ import { useRef, useEffect, useState } from 'react';
 
 export default function ChatPage() {
   const [parsedSources, setParsedSources] = useState({});
+  const [parsedSuggested, setParsedSuggested] = useState({});
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
-  const { messages, input, setInput, handleInputChange, handleSubmit, isLoading } = useChat({
+  const { messages, input, setInput, handleInputChange, handleSubmit, append, isLoading } = useChat({
     api: '/api/chat',
-    // CORRECTED: Use onFinish to reliably parse metadata after the stream is complete
     onFinish: (message) => {
       const text = message.content || '';
-      const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])/;
+      const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])\s*/;
+      const suggestedRegex = /SUGGESTED:\s*(\[[\s\S]*?\])\s*$/m;
+
       const sourcesMatch = text.match(sourcesRegex);
       if (sourcesMatch && sourcesMatch[1]) {
         try {
           const parsed = JSON.parse(sourcesMatch[1]);
           setParsedSources(prev => ({ ...prev, [message.id]: parsed }));
         } catch (e) {
-          console.warn('Failed to parse SOURCES_JSON for message', message.id, e);
+          console.warn('Failed to parse SOURCES_JSON:', e);
+        }
+      }
+
+      const suggestedMatch = text.match(suggestedRegex);
+      if (suggestedMatch && suggestedMatch[1]) {
+        try {
+          const parsed = JSON.parse(suggestedMatch[1]);
+          setParsedSuggested(prev => ({ ...prev, [message.id]: parsed }));
+        } catch (e) {
+          console.warn('Failed to parse SUGGESTED:', e);
         }
       }
     }
@@ -36,11 +48,17 @@ export default function ChatPage() {
   }, [messages]);
 
   function stripMetadata(content) {
-    if (!content) return '';
-    return content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])/g, '').trim();
+    return (content || '')
+      .replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*/g, '')
+      .replace(/SUGGESTED:\s*(\[[\s\S]*?\])\s*$/m, '')
+      .trim();
   }
 
-  const defaultSuggestedPrompts = [
+  function handleSuggestedClick(prompt) {
+    append({ role: 'user', content: prompt });
+  }
+
+  const defaultSuggestedPrompts = [ // The variable is defined here
     "What are H-1B qualifications?",
     "What documents do I need for OPT travel?",
     "Explain the F-1 OPT policy."
@@ -56,13 +74,18 @@ export default function ChatPage() {
       <main className="flex-1 overflow-y-auto p-4">
         <div className="space-y-4 max-w-3xl mx-auto">
           {messages.map((msg) => {
-            const cleanedContent = stripMetadata(msg.content);
+            const cleaned = stripMetadata(msg.content);
             const sources = parsedSources[msg.id];
+            const suggested = parsedSuggested[msg.id];
 
             return (
               <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
-                <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-blue-600 text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
-                  <p className="whitespace-pre-wrap text-sm">{cleanedContent}</p>
+                <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (msg.role === 'user'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-white text-neutral-900 border border-neutral-200')}>
+
+                  <p className="whitespace-pre-wrap text-sm">{cleaned}</p>
+
                   {sources && sources.length > 0 && (
                     <div className="mt-2 border-t border-neutral-200 pt-2">
                       <p className="text-xs font-semibold text-neutral-600 mb-1">Sources:</p>
@@ -78,6 +101,23 @@ export default function ChatPage() {
                               s.title
                             )}
                           </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {suggested && Array.isArray(suggested) && suggested.length > 0 && (
+                    <div className="mt-2 pt-2">
+                      <p className="text-xs font-semibold text-neutral-600 mb-1">Suggested Follow-ups:</p>
+                      <div className="flex flex-wrap gap-2">
+                        {suggested.map((p, idx) => (
+                          <button
+                            key={idx}
+                            onClick={() => handleSuggestedClick(p)}
+                            className="px-3 py-1 bg-neutral-200 text-neutral-700 text-xs rounded-full hover:bg-neutral-300 transition-colors"
+                          >
+                            {p}
+                          </button>
                         ))}
                       </div>
                     </div>
@@ -108,7 +148,8 @@ export default function ChatPage() {
 
           {messages.length === 0 && (
             <div className="mb-3 flex flex-wrap gap-2">
-              {defaultSuggested.map((prompt, i) => (
+              {/* THIS IS THE CORRECTED LINE: */}
+              {defaultSuggestedPrompts.map((prompt, i) => ( 
                 <button key={i} onClick={() => setInput(prompt)} className="px-3 py-1 bg-neutral-200 text-neutral-700 text-sm rounded-full hover:bg-neutral-300 transition-colors">
                   {prompt}
                 </button>
