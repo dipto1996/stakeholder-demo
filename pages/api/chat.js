@@ -1,10 +1,9 @@
 // chat.js — Final Production-Grade Version
-// Incorporates all user feedback for robustness, idempotency, and error handling.
+// This version fixes the greeting handler to ensure all responses use a compatible stream format.
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
 import { sql } from '@vercel/postgres';
 
-// This is the critical line that tells Vercel to use the correct, high-performance environment
 export const config = { runtime: 'edge' };
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -14,19 +13,19 @@ const EMBEDDING_MODEL = 'text-embedding-3-small';
 const CHAT_MODEL = 'gpt-4o-mini';
 const EMB_RETRIES = 3;
 const CHAT_RETRIES = 2;
-const MAX_EXCERPT_LENGTH = 1600; 
-const MAX_CONTEXT_LENGTH = 6000;
+const MAX_EXCERPT = 1600;
+const MAX_CONTEXT_TOTAL = 6000;
 
 // --- Helper Functions ---
 async function createEmbeddingsWithRetry(input) {
   for (let attempt = 0; attempt < EMB_RETRIES; attempt++) {
     try {
-      const response = await openai.embeddings.create({ model: EMBEDDING_MODEL, input });
-      if (!response?.data?.[0]?.embedding) throw new Error("Embedding API returned no embedding.");
-      return response;
+      const resp = await openai.embeddings.create({ model: EMBEDDING_MODEL, input });
+      if (!resp?.data?.[0]?.embedding) throw new Error('No embedding returned');
+      return resp;
     } catch (e) {
       if (attempt === EMB_RETRIES - 1) throw e;
-      await new Promise(r => setTimeout(r, 2 ** attempt * 1000));
+      await new Promise((r) => setTimeout(r, 2 ** attempt * 1000));
     }
   }
 }
@@ -42,7 +41,7 @@ async function createCompletionWithRetry(messages) {
       });
     } catch (e) {
       if (attempt === CHAT_RETRIES - 1) throw e;
-      await new Promise(r => setTimeout(r, 2 ** attempt * 1000));
+      await new Promise((r) => setTimeout(r, 2 ** attempt * 1000));
     }
   }
 }
@@ -55,32 +54,30 @@ export default async function handler(req) {
 
   try {
     const { messages } = await req.json();
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return new Response('Invalid request body', { status: 400 });
-    }
     const userQuery = (messages[messages.length - 1].content || '').trim();
     if (!userQuery) return new Response('Empty user query', { status: 400 });
 
-    const GREETING_RE = /^(hi|hello|hey)\b/i;
+    // CORRECTED: The greeting handler now uses the OpenAI API to generate a response,
+    // guaranteeing a stream format that is 100% compatible with the frontend.
+    const GREETING_RE = /^(hi|hello|hey|good morning|good afternoon|good evening)\b/i;
     if (GREETING_RE.test(userQuery)) {
-      const greetingStream = new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode("Hello! How can I help with your U.S. immigration questions?"));
-          controller.close();
-        }
-      });
-      return new StreamingTextResponse(greetingStream);
+      const greetMessages = [
+        { role: 'system', content: 'You are a friendly assistant for U.S. immigration questions. Greet the user concisely and ask how you can help.' },
+        { role: 'user', content: userQuery },
+      ];
+      const greetCompletion = await createCompletionWithRetry(greetMessages);
+      const greetStream = OpenAIStream(greetCompletion);
+      return new StreamingTextResponse(greetStream);
     }
 
     const embResp = await createEmbeddingsWithRetry(userQuery);
     const queryEmbedding = embResp.data[0].embedding;
 
-    // CORRECTED: Added ::vector cast for robust querying
     const { rows } = await sql`
-        SELECT source_title, source_url, content 
-        FROM documents 
-        ORDER BY embedding <=> ${JSON.stringify(queryEmbedding)}::vector
-        LIMIT 5
+      SELECT content, source_file, source_title, source_url
+      FROM documents
+      ORDER BY embedding <=> ${JSON.stringify(queryEmbedding)}::vector
+      LIMIT 5
     `;
 
     if (!rows || rows.length === 0) {
@@ -95,40 +92,35 @@ export default async function handler(req) {
 
     const sources = rows.map((r, i) => ({
       id: i + 1,
-      title: r.source_title || "Untitled Source",
+      title: r.source_title || r.source_file || "Untitled Source",
       url: r.source_url,
     }));
-    
+
     let totalChars = 0;
     const contextParts = [];
     for (let i = 0; i < rows.length; i++) {
-      const excerpt = (rows[i].content || '').slice(0, MAX_EXCERPT_LENGTH);
-      if (totalChars + excerpt.length > MAX_CONTEXT_LENGTH) break;
-      contextParts.push(`[${i + 1}] source: ${rows[i].source_title || 'Unknown Source'}\ncontent: ${excerpt}`);
+      const excerpt = (rows[i].content || '').slice(0, MAX_EXCERPT);
+      if (totalChars + excerpt.length > MAX_CONTEXT_TOTAL) break;
+      contextParts.push(`[${i + 1}] source: ${rows[i].source_title || rows[i].source_file}\ncontent: ${excerpt}`);
       totalChars += excerpt.length;
     }
     const contextText = contextParts.join('\n\n---\n\n');
-    
-    const systemPrompt = `You are a friendly and professional AI assistant for U.S. immigration questions. Use ONLY the numbered sources in the CONTEXT section below to answer the user's QUESTION. You must cite your sources for every factual claim you make using the format [1], [2], etc. Your response should be structured with a short direct answer, followed by key points in a bulleted list, and finally a list of next steps. Do NOT provide legal advice. If the context is insufficient, state that you cannot find the answer in the provided documents. At the very end of your response, include a machine-parsable line exactly like: SOURCES_JSON:[{"id":1,"title":"Source Title","url":"https://..."}, ...]`;
+
+    const systemPrompt = `You are a friendly, careful, and accurate assistant for U.S. immigration questions. Rules: Use ONLY the CONTEXT below for factual claims. Cite facts using bracketed source numbers like [1], [2]. Output structure: (1) Short direct answer, (2) Key points (bulleted), (3) Next steps. At the very end, include a machine-parsable line exactly like: SOURCES_JSON:[{"id":1,"title":"Source Title","url":"https://..."}] Do NOT provide legal advice.`;
     const userPrompt = `CONTEXT:\n${contextText}\n\nQUESTION:\n${userQuery}`;
 
     const messagesForModel = [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt }
+      { role: 'user', content: userPrompt },
     ];
 
     const completion = await createCompletionWithRetry(messagesForModel);
+    const modelStream = OpenAIStream(completion);
 
-    // The Vercel AI SDK handles the streaming response
-    const stream = OpenAIStream(completion, {
-        onFinal(completion) {
-            // This is a good place to add logging or other final actions
-        },
-    });
-    return new StreamingTextResponse(stream);
+    return new StreamingTextResponse(modelStream);
 
   } catch (err) {
-    console.error('Error in handler:', err);
+    console.error('chat handler error:', err);
     return new Response('Internal Server Error', { status: 500 });
   }
 }
