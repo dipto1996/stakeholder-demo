@@ -7,20 +7,20 @@ export default function ChatPage() {
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
-  const { messages, input, setInput, handleInputChange, handleSubmit, append, isLoading } = useChat({
+  const { messages, input, setInput, handleInputChange, handleSubmit, isLoading } = useChat({
     api: '/api/chat',
+    // onFinish receives the final message (after streaming finishes)
     onFinish: (message) => {
-      if (!message || message.role !== 'assistant') return;
-      const text = message.content || '';
-      // Accept optional leading "data: " (SSE preamble) and whitespace
-      const sourcesRegex = /^\s*(?:data:\s*)?SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/;
-      const match = text.match(sourcesRegex);
-      if (match && match[1]) {
+      if (!message?.content) return;
+      // Capture trailing SOURCES_JSON:[...] block (non-greedy)
+      const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m;
+      const m = message.content.match(sourcesRegex);
+      if (m && m[1]) {
         try {
-          const parsed = JSON.parse(match[1]);
+          const parsed = JSON.parse(m[1]);
           setParsedSources(prev => ({ ...prev, [message.id]: parsed }));
         } catch (e) {
-          console.warn('Failed to parse SOURCES_JSON for message', message.id, e);
+          console.warn('Failed to parse SOURCES_JSON', e);
         }
       }
     }
@@ -30,52 +30,47 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  useEffect(() => {
-    fetch('/trending.json').then(r => r.json()).then(setTrendingTopics).catch(() => {});
-  }, []);
-
-  function stripPreamble(content) {
+  function stripSourcesMetadata(content) {
     if (!content) return '';
-    return content.replace(/^\s*(?:data:\s*)?SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/, '').trim();
+    return content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m, '').trim();
   }
 
-  const suggestedPrompts = [
+  const defaultSuggestedPrompts = [
     "What are H-1B qualifications?",
     "What documents do I need for OPT travel?",
-    "Explain the F-1 OPT policy."
+    "Explain F-1 OPT policy.",
   ];
 
   return (
     <div className="flex flex-col h-screen bg-neutral-50 font-sans">
       <header className="p-4 border-b bg-white shadow-sm">
         <h1 className="text-xl font-semibold text-neutral-900">Immigration AI Assistant</h1>
-        <p className="text-sm text-neutral-500">Informational Tool — Not Legal Advice</p>
+        <p className="text-sm text-neutral-500">Informational Tool - Not Legal Advice</p>
       </header>
 
       <main className="flex-1 overflow-y-auto p-4">
         <div className="space-y-4 max-w-3xl mx-auto">
-          {messages.map(msg => {
-            const cleaned = stripPreamble(msg.content || '');
-            const sources = parsedSources[msg.id] || [];
-            const isUser = msg.role === 'user';
+          {messages.map((msg) => {
+            const cleaned = stripSourcesMetadata(msg.content);
+            const sources = parsedSources[msg.id];
             return (
-              <div key={msg.id} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
-                <div className={`max-w-xl p-3 rounded-lg shadow-sm ${isUser ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200'}`}>
+              <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
+                <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
                   <p className="whitespace-pre-wrap text-sm">{cleaned}</p>
 
-                  {Array.isArray(sources) && sources.length > 0 && (
+                  {sources && sources.length > 0 && (
                     <div className="mt-2 border-t border-neutral-200 pt-2">
-                      <p className="text-xs font-semibold text-neutral-600 mb-1">Sources</p>
+                      <p className="text-xs font-semibold text-neutral-600 mb-1">Sources:</p>
                       <div className="space-y-1">
-                        {sources.map(s => (
-                          <div key={s.id} className="text-xs text-neutral-500">
-                            [{s.id}]&nbsp;
-                            {s.url ? (
-                              <a href={s.url} target="_blank" rel="noreferrer" className="underline hover:text-brand-blue">
-                                {s.title || s.url}
+                        {sources.map(src => (
+                          <div key={src.id} className="text-xs text-neutral-500">
+                            [{src.id}] {' '}
+                            {src.url ? (
+                              <a href={src.url} target="_blank" rel="noopener noreferrer" className="underline hover:text-brand-blue">
+                                {src.title || src.url}
                               </a>
                             ) : (
-                              s.title || 'Unknown source'
+                              src.title || 'Untitled source'
                             )}
                           </div>
                         ))}
@@ -92,30 +87,15 @@ export default function ChatPage() {
 
       <footer className="p-4 border-t bg-white">
         <div className="max-w-3xl mx-auto">
-          {messages.length === 0 && trendingTopics.length > 0 && (
-            <div className="mb-4">
-              <h3 className="text-sm font-semibold text-neutral-700 mb-2">Trending Topics</h3>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-                {trendingTopics.map((t, i) => (
-                  <div key={i} className="p-3 bg-neutral-100 rounded-md border border-neutral-200">
-                    <p className="font-semibold text-sm text-neutral-900">{t.title}</p>
-                    <p className="text-xs text-neutral-500">{t.blurb}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
           {messages.length === 0 && (
             <div className="mb-3 flex flex-wrap gap-2">
-              {suggestedPrompts.map((p, i) => (
-                <button key={i} onClick={() => setInput(p)} className="px-3 py-1 bg-neutral-200 text-neutral-700 text-sm rounded-full hover:bg-neutral-300 transition-colors">
-                  {p}
+              {defaultSuggestedPrompts.map((prompt, idx) => (
+                <button key={idx} onClick={() => setInput(prompt)} className="px-3 py-1 bg-neutral-200 text-neutral-700 text-sm rounded-full hover:bg-neutral-300 transition-colors">
+                  {prompt}
                 </button>
               ))}
             </div>
           )}
-
           <form onSubmit={handleSubmit}>
             <div className="flex space-x-2">
               <input
