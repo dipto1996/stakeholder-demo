@@ -12,8 +12,8 @@ const EMBEDDING_MODEL = 'text-embedding-3-small';
 const CHAT_MODEL = 'gpt-4o-mini';
 const EMB_RETRIES = 3;
 const CHAT_RETRIES = 2;
-const MAX_EXCERPT = 1600;
-const MAX_CONTEXT_TOTAL = 6000;
+const MAX_EXCERPT = 1400;
+const MAX_CONTEXT_TOTAL = 5000;
 
 async function createEmbeddingsWithRetry(input) {
   for (let attempt = 0; attempt < EMB_RETRIES; attempt++) {
@@ -50,32 +50,32 @@ export default async function handler(req) {
   }
 
   try {
-    const { messages } = await req.json();
+    const body = await req.json();
+    const { messages } = body || {};
     if (!Array.isArray(messages) || messages.length === 0) {
       return new Response('Invalid request body', { status: 400 });
     }
     const userQuery = (messages[messages.length - 1].content || '').trim();
     if (!userQuery) return new Response('Empty user query', { status: 400 });
 
-    // Quick greeting shortcut (use same streaming format as normal completions)
+    // Greeting shortcut — use model produced stream (keeps consistent stream format)
     const GREETING_RE = /^(hi|hello|hey|good morning|good afternoon|good evening)\b/i;
     if (GREETING_RE.test(userQuery)) {
-      // Use the model to generate a greeting so stream shape is identical
       const greetMessages = [
-        { role: 'system', content: 'You are a concise friendly assistant for U.S. immigration.' },
-        { role: 'user', content: userQuery }
+        { role: 'system', content: 'You are a concise, friendly U.S. immigration assistant.' },
+        { role: 'user', content: userQuery },
       ];
       const greetCompletion = await createCompletionWithRetry(greetMessages);
       const greetStream = OpenAIStream(greetCompletion);
       return new StreamingTextResponse(greetStream);
     }
 
-    // 1) create embedding for query
+    // 1) Embedding
     const embResp = await createEmbeddingsWithRetry(userQuery);
     const queryEmbedding = embResp.data[0].embedding;
     const embLiteral = JSON.stringify(queryEmbedding);
 
-    // 2) retrieve top-k docs from DB (pgvector)
+    // 2) Retrieve top-K docs (pgvector cast)
     const q = await sql`
       SELECT source_title, source_url, content
       FROM documents
@@ -84,7 +84,7 @@ export default async function handler(req) {
     `;
     const rows = q?.rows ?? [];
 
-    // fallback if no docs
+    // 3) fallback if no rows found
     if (!rows || rows.length === 0) {
       const fallback = "I couldn't find supporting documents in our indexed sources for that question.";
       const s = new ReadableStream({
@@ -96,7 +96,7 @@ export default async function handler(req) {
       return new StreamingTextResponse(s);
     }
 
-    // 3) build sources and context (trimmed)
+    // 4) Build sources and context, trimmed
     const sources = rows.map((r, i) => ({
       id: i + 1,
       title: r.source_title || r.source_url || `source_${i + 1}`,
@@ -113,15 +113,16 @@ export default async function handler(req) {
     }
     const contextText = parts.join('\n\n---\n\n');
 
-    // 4) compose prompt instructing model to cite sources, and to embed machine-readable sources at end
+    // 5) System + user prompt
     const systemPrompt = `
 You are a friendly and professional AI assistant for U.S. immigration questions.
-Use ONLY the numbered sources in the CONTEXT section below to answer the user's QUESTION.
-Cite every factual claim with bracketed source numbers like [1], [2].
-Structure output: short direct answer (1-3 sentences), key points (bulleted), next steps (1-3).
-Do NOT provide legal advice.
-At the very end include a machine-parsable JSON exactly like: SUGGESTED: ["follow up 1", "follow up 2"]
-    `.trim();
+Rules:
+- Use ONLY the provided CONTEXT / SOURCES for factual claims (do NOT hallucinate).
+- Cite facts with bracketed source numbers like [1], [2].
+- Output structure: (1) Short direct answer (1-3 sentences), (2) Key points (bulleted), (3) Next steps (1-3).
+- Do NOT provide legal advice.
+At the end include a machine-parsable SUGGESTED array like: SUGGESTED: ["follow-up 1","follow-up 2"]
+`.trim();
 
     const userPrompt = `CONTEXT:\n${contextText}\n\nQUESTION:\n${userQuery}`;
 
@@ -130,29 +131,34 @@ At the very end include a machine-parsable JSON exactly like: SUGGESTED: ["follo
       { role: 'user', content: userPrompt }
     ];
 
-    // 5) get streaming completion
+    // 6) Get streaming completion
     const completion = await createCompletionWithRetry(messagesForModel);
 
-    // 6) create an OpenAIStream and attach structured metadata
-    // Note: experimental_streamData option (and stream.append) depends on ai SDK version.
-    const stream = OpenAIStream(completion, { experimental_streamData: true });
+    // 7) Prepare textual preamble with SOURCES_JSON and optional SUGGESTED (frontend will parse this)
+    const preambleObj = {
+      sources
+    };
+    const preambleText = `SOURCES_JSON:${JSON.stringify(preambleObj.sources)}\n\n`;
+    const encodedPreamble = new TextEncoder().encode(preambleText);
 
-    // append structured metadata payload so frontend receives it as `data` (synchronized)
-    // (If your ai SDK/version doesn't support stream.append, you can instead embed SOURCES_JSON preamble—older approach.)
-    try {
-      if (typeof stream.append === 'function') {
-        stream.append({ sources });
-      } else {
-        // fallback: prepend a small JSON preamble text so legacy frontends can parse
-        // we enqueue preamble bytes first and then let the model stream proceed
-        // (but prefer stream.append when available)
+    // 8) Pipe preamble followed by model stream so legacy & current frontends can parse reliably
+    const modelStream = OpenAIStream(completion);
+    const combined = new ReadableStream({
+      async start(controller) {
+        // send preamble first
+        controller.enqueue(encodedPreamble);
+        // then pipe the model stream
+        const reader = modelStream.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+        controller.close();
       }
-    } catch (e) {
-      // non-fatal — proceed without append if unsupported
-      console.warn('Could not append structured stream metadata:', e);
-    }
+    });
 
-    return new StreamingTextResponse(stream);
+    return new StreamingTextResponse(combined);
 
   } catch (err) {
     console.error('chat handler error:', err);
