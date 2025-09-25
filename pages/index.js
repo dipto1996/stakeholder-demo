@@ -7,17 +7,18 @@ export default function ChatPage() {
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
+  // useChat must be called after hooks
   const { messages, input, setInput, handleInputChange, handleSubmit, isLoading } = useChat({
     api: '/api/chat',
-    // onFinish receives the final message (after streaming finishes)
+    // parse final message content after stream completes
     onFinish: (message) => {
       if (!message?.content) return;
-      // Capture trailing SOURCES_JSON:[...] block (non-greedy)
+      // non-greedy, multi-line match for trailing SOURCES_JSON
       const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m;
-      const m = message.content.match(sourcesRegex);
-      if (m && m[1]) {
+      const match = message.content.match(sourcesRegex);
+      if (match && match[1]) {
         try {
-          const parsed = JSON.parse(m[1]);
+          const parsed = JSON.parse(match[1]);
           setParsedSources(prev => ({ ...prev, [message.id]: parsed }));
         } catch (e) {
           console.warn('Failed to parse SOURCES_JSON', e);
@@ -27,11 +28,19 @@ export default function ChatPage() {
   });
 
   useEffect(() => {
+    fetch('/trending.json')
+      .then((r) => r.json())
+      .then((d) => setTrendingTopics(d))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  function stripSourcesMetadata(content) {
+  function stripMetadata(content) {
     if (!content) return '';
+    // strip trailing SOURCES_JSON block
     return content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m, '').trim();
   }
 
@@ -51,26 +60,27 @@ export default function ChatPage() {
       <main className="flex-1 overflow-y-auto p-4">
         <div className="space-y-4 max-w-3xl mx-auto">
           {messages.map((msg) => {
-            const cleaned = stripSourcesMetadata(msg.content);
+            const cleaned = stripMetadata(msg.content);
             const sources = parsedSources[msg.id];
+
             return (
               <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
                 <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
                   <p className="whitespace-pre-wrap text-sm">{cleaned}</p>
 
-                  {sources && sources.length > 0 && (
+                  {sources && Array.isArray(sources) && sources.length > 0 && (
                     <div className="mt-2 border-t border-neutral-200 pt-2">
                       <p className="text-xs font-semibold text-neutral-600 mb-1">Sources:</p>
                       <div className="space-y-1">
-                        {sources.map(src => (
-                          <div key={src.id} className="text-xs text-neutral-500">
-                            [{src.id}] {' '}
-                            {src.url ? (
-                              <a href={src.url} target="_blank" rel="noopener noreferrer" className="underline hover:text-brand-blue">
-                                {src.title || src.url}
+                        {sources.map((s) => (
+                          <div key={s.id} className="text-xs text-neutral-500">
+                            [{s.id}] {' '}
+                            {s.url ? (
+                              <a href={s.url} target="_blank" rel="noopener noreferrer" className="underline hover:text-brand-blue">
+                                {s.title || s.url}
                               </a>
                             ) : (
-                              src.title || 'Untitled source'
+                              s.title || s.url || 'Untitled source'
                             )}
                           </div>
                         ))}
@@ -87,6 +97,20 @@ export default function ChatPage() {
 
       <footer className="p-4 border-t bg-white">
         <div className="max-w-3xl mx-auto">
+          {messages.length === 0 && trendingTopics.length > 0 && (
+            <div className="mb-4">
+              <h3 className="text-sm font-semibold text-neutral-700 mb-2">Trending Topics</h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                {trendingTopics.map((topic, i) => (
+                  <div key={i} className="p-3 bg-neutral-100 rounded-md border border-neutral-200">
+                    <p className="font-semibold text-sm text-neutral-900">{topic.title}</p>
+                    <p className="text-xs text-neutral-500">{topic.blurb}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {messages.length === 0 && (
             <div className="mb-3 flex flex-wrap gap-2">
               {defaultSuggestedPrompts.map((prompt, idx) => (
@@ -96,6 +120,7 @@ export default function ChatPage() {
               ))}
             </div>
           )}
+
           <form onSubmit={handleSubmit}>
             <div className="flex space-x-2">
               <input
