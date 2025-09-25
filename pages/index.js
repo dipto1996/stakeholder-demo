@@ -3,11 +3,11 @@ import { useChat } from 'ai/react';
 import { useRef, useEffect, useState } from 'react';
 
 export default function ChatPage() {
+  const [parsedSourcesMap, setParsedSourcesMap] = useState({}); // messageId -> sources array
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
-  // IMPORTANT: `data` is the per-message metadata array from useChat (keeps sync with messages)
-  // Make sure your ai/react version supports returning `data` for messages.
+  // useChat hook (onFinish used to parse preamble reliably)
   const {
     messages,
     input,
@@ -15,9 +15,38 @@ export default function ChatPage() {
     handleInputChange,
     handleSubmit,
     isLoading,
-    data, // <-- metadata array aligned with messages
   } = useChat({
     api: '/api/chat',
+    onFinish: (message) => {
+      // message.content contains the full streamed text once complete
+      const text = message?.content || '';
+      // Look for the preamble: SOURCES_JSON:[...]\n\n  (non-greedy)
+      const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/;
+      const suggestedRegex = /SUGGESTED:\s*(\[[\s\S]*?\])\s*$/m;
+
+      // parse SOURCES_JSON
+      const sMatch = text.match(sourcesRegex);
+      if (sMatch && sMatch[1]) {
+        try {
+          const parsedSources = JSON.parse(sMatch[1]);
+          setParsedSourcesMap(prev => ({ ...prev, [message.id]: parsedSources }));
+        } catch (e) {
+          console.warn('Failed to parse SOURCES_JSON for message', message.id, e);
+        }
+      }
+
+      // Optionally parse SUGGESTED if model appended it at end (not required)
+      const sugMatch = text.match(suggestedRegex);
+      if (sugMatch && sugMatch[1]) {
+        try {
+          const parsedSuggested = JSON.parse(sugMatch[1]);
+          // store in parsedSourcesMap under message.id as .suggested (optional)
+          setParsedSourcesMap(prev => ({ ...prev, [message.id]: { ...(prev[message.id] || {}), suggested: parsedSuggested } }));
+        } catch (e) {
+          console.warn('Failed to parse SUGGESTED for message', message.id, e);
+        }
+      }
+    }
   });
 
   useEffect(() => {
@@ -31,14 +60,22 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  function renderSourcesForIndex(idx) {
-    // data is aligned with messages; each entry may be undefined or contain { sources: [...] }
-    const meta = data?.[idx];
-    const sources = meta?.sources ?? [];
+  // remove metadata preamble from displayed message content
+  function stripPreamble(content) {
+    if (!content) return '';
+    // Remove SOURCES_JSON preamble and SUGGESTED tail if present
+    const withoutSources = content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/, '');
+    const withoutSuggested = withoutSources.replace(/\n?SUGGESTED:\s*(\[[\s\S]*?\])\s*$/m, '');
+    return withoutSuggested.trim();
+  }
+
+  function renderSourcesForMessage(msg) {
+    const meta = parsedSourcesMap[msg.id];
+    const sources = meta ? (meta.suggested ? meta.sources : meta) : meta;
     if (!sources || sources.length === 0) return null;
 
     return (
-      <div className="mt-2 border-t border-neutral-200 pt-2 bg-neutral-50 px-2 py-1 rounded">
+      <div className="mt-2 border-t border-neutral-200 pt-2 bg-neutral-50 px-3 py-2 rounded">
         <p className="text-xs font-semibold text-neutral-600 mb-1">Sources</p>
         <div className="space-y-1">
           {sources.map(src => (
@@ -46,10 +83,10 @@ export default function ChatPage() {
               [{src.id}] {' '}
               {src.url ? (
                 <a href={src.url} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">
-                  {src.title}
+                  {src.title || src.url}
                 </a>
               ) : (
-                <span className="text-neutral-700">{src.title}</span>
+                <span className="text-neutral-700">{src.title || 'Untitled source'}</span>
               )}
             </div>
           ))}
@@ -76,8 +113,8 @@ export default function ChatPage() {
           {messages.map((msg, i) => (
             <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
               <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
-                <p className="whitespace-pre-wrap text-sm">{msg.content}</p>
-                {renderSourcesForIndex(i)}
+                <p className="whitespace-pre-wrap text-sm">{stripPreamble(msg.content)}</p>
+                {renderSourcesForMessage(msg)}
               </div>
             </div>
           ))}
