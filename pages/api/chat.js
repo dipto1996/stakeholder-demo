@@ -1,32 +1,28 @@
-// chat.js — Final Production-Grade Version
-// Incorporates all user feedback for robustness, idempotency, and error handling.
+// pages/api/chat.js — Final production-ready Edge RAG handler
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
 import { sql } from '@vercel/postgres';
 
-// This is the critical line that tells Vercel to use the correct, high-performance environment
 export const config = { runtime: 'edge' };
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --- Configuration ---
 const EMBEDDING_MODEL = 'text-embedding-3-small';
 const CHAT_MODEL = 'gpt-4o-mini';
 const EMB_RETRIES = 3;
 const CHAT_RETRIES = 2;
-const MAX_EXCERPT_LENGTH = 1600;
-const MAX_CONTEXT_LENGTH = 6000;
+const MAX_EXCERPT = 1600;
+const MAX_CONTEXT_TOTAL = 6000;
 
-// --- Helper Functions ---
 async function createEmbeddingsWithRetry(input) {
   for (let attempt = 0; attempt < EMB_RETRIES; attempt++) {
     try {
-      const response = await openai.embeddings.create({ model: EMBEDDING_MODEL, input });
-      if (!response?.data?.[0]?.embedding) throw new Error("Embedding API returned no embedding.");
-      return response;
+      const resp = await openai.embeddings.create({ model: EMBEDDING_MODEL, input });
+      if (!resp?.data?.[0]?.embedding) throw new Error('No embedding returned');
+      return resp;
     } catch (e) {
       if (attempt === EMB_RETRIES - 1) throw e;
-      await new Promise(r => setTimeout(r, 2 ** attempt * 1000));
+      await new Promise((r) => setTimeout(r, 2 ** attempt * 1000));
     }
   }
 }
@@ -42,12 +38,14 @@ async function createCompletionWithRetry(messages) {
       });
     } catch (e) {
       if (attempt === CHAT_RETRIES - 1) throw e;
-      await new Promise(r => setTimeout(r, 2 ** attempt * 1000));
+      await new Promise((r) => setTimeout(r, 2 ** attempt * 1000));
     }
   }
 }
 
-// --- Main API Handler ---
+/**
+ * server handler
+ */
 export default async function handler(req) {
   if (req.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 });
@@ -58,58 +56,90 @@ export default async function handler(req) {
     if (!Array.isArray(messages) || messages.length === 0) {
       return new Response('Invalid request body', { status: 400 });
     }
+
     const userQuery = (messages[messages.length - 1].content || '').trim();
     if (!userQuery) return new Response('Empty user query', { status: 400 });
 
-    const GREETING_RE = /^(hi|hello|hey)\b/i;
+    // Quick greeting shortcut — return a small LLM-generated stream so format matches full responses
+    const GREETING_RE = /^(hi|hello|hey|good morning|good afternoon|good evening)\b/i;
     if (GREETING_RE.test(userQuery)) {
-      const greetingStream = new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode("Hello! How can I help with your U.S. immigration questions?"));
+      // Use model to generate greeting so output format matches production responses
+      const greetMessages = [
+        { role: 'system', content: 'You are a friendly assistant for U.S. immigration questions. Greet concisely.' },
+        { role: 'user', content: userQuery }
+      ];
+      const greetCompletion = await createCompletionWithRetry(greetMessages);
+      const greetStream = OpenAIStream(greetCompletion);
+
+      // Ensure SOURCES_JSON exists even for greetings
+      const guardedGreeting = new ReadableStream({
+        async start(controller) {
+          const reader = greetStream.getReader();
+          let fullText = '';
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = new TextDecoder().decode(value);
+            fullText += chunk;
+            controller.enqueue(value);
+          }
+          if (!/SOURCES_JSON:/i.test(fullText)) {
+            controller.enqueue(new TextEncoder().encode(`\n\nSOURCES_JSON:[]`));
+          }
           controller.close();
         }
       });
-      return new StreamingTextResponse(greetingStream);
+
+      return new StreamingTextResponse(guardedGreeting);
     }
 
+    // 1) Embedding
     const embResp = await createEmbeddingsWithRetry(userQuery);
     const queryEmbedding = embResp.data[0].embedding;
 
-    // CORRECTED: Added ::vector cast for robust querying
-    const { rows } = await sql`
-        SELECT source_title, source_url, content
-        FROM documents
-        ORDER BY embedding <=> ${JSON.stringify(queryEmbedding)}::vector
-        LIMIT 5
+    // 2) Retrieve top-k from DB (using @vercel/postgres sql tagged template)
+    const embLiteral = JSON.stringify(queryEmbedding);
+    const q = await sql`
+      SELECT source_title, source_url, content
+      FROM documents
+      ORDER BY embedding <=> ${embLiteral}::vector
+      LIMIT 6
     `;
+    const rows = q?.rows ?? [];
 
+    // 3) No results -> friendly fallback (no LLM call)
     if (!rows || rows.length === 0) {
-      const fallbackStream = new ReadableStream({
+      const fallback = "I couldn't find supporting documents in our indexed sources for that question.";
+      // add SOURCES_JSON empty array so frontend parsing is consistent
+      const fallbackWithMeta = `${fallback}\n\nSOURCES_JSON:[]`;
+      const s = new ReadableStream({
         start(controller) {
-          controller.enqueue(new TextEncoder().encode("I couldn't find supporting documents in our indexed sources for that question."));
+          controller.enqueue(new TextEncoder().encode(fallbackWithMeta));
           controller.close();
         }
       });
-      return new StreamingTextResponse(fallbackStream);
+      return new StreamingTextResponse(s);
     }
 
+    // 4) Build sources & context (trim excerpts + cap total)
     const sources = rows.map((r, i) => ({
       id: i + 1,
-      title: r.source_title || "Untitled Source",
-      url: r.source_url,
+      title: r.source_title || `source_${i + 1}`,
+      url: r.source_url || null,
     }));
 
     let totalChars = 0;
     const contextParts = [];
     for (let i = 0; i < rows.length; i++) {
-      const excerpt = (rows[i].content || '').slice(0, MAX_EXCERPT_LENGTH);
-      if (totalChars + excerpt.length > MAX_CONTEXT_LENGTH) break;
-      contextParts.push(`[${i + 1}] source: ${rows[i].source_title || 'Unknown Source'}\ncontent: ${excerpt}`);
+      const excerpt = (rows[i].content || '').slice(0, MAX_EXCERPT);
+      if (totalChars + excerpt.length > MAX_CONTEXT_TOTAL) break;
+      contextParts.push(`[${i + 1}] source_title: ${rows[i].source_title || rows[i].source_url || 'Untitled'}\ncontent: ${excerpt}`);
       totalChars += excerpt.length;
     }
     const contextText = contextParts.join('\n\n---\n\n');
 
-    const systemPrompt = `You are a friendly and professional AI assistant for U.S. immigration questions. Use ONLY the numbered sources in the CONTEXT section below to answer the user's QUESTION. You must cite your sources for every factual claim you make using the format [1], [2], etc. Your response should be structured with a short direct answer, followed by key points in a bulleted list, and finally a list of next steps. Do NOT provide legal advice. If the context is insufficient, state that you cannot find the answer in the provided documents. At the very end of your response, include a machine-parsable line exactly like: SOURCES_JSON:[{"id":1,"title":"Source Title","url":"https://..."}]`;
+    // 5) Prompt engineering
+    const systemPrompt = `You are a friendly and professional AI assistant for U.S. immigration questions. Use ONLY the numbered sources in the CONTEXT section below to answer the user's QUESTION. Cite facts using bracketed source numbers like [1], [2]. Output structure: short direct answer (1-3 sentences), key points (bulleted), next steps (1-3 items). Do NOT provide legal advice. At the very end include a machine-parsable line exactly like: SOURCES_JSON:[{"id":1,"title":"Source Title","url":"https://..."}]`;
     const userPrompt = `CONTEXT:\n${contextText}\n\nQUESTION:\n${userQuery}`;
 
     const messagesForModel = [
@@ -117,30 +147,37 @@ export default async function handler(req) {
       { role: 'user', content: userPrompt }
     ];
 
+    // 6) Ask LLM (streaming)
     const completion = await createCompletionWithRetry(messagesForModel);
-
-    // The Vercel AI SDK handles the streaming response, but we add the preamble first.
-    const preamble = `SOURCES_JSON:${JSON.stringify(sources)}\n\n`;
-    const encodedPreamble = new TextEncoder().encode(preamble);
     const modelStream = OpenAIStream(completion);
 
-    const combinedStream = new ReadableStream({
+    // 7) Guarded stream: pass chunks through and ensure SOURCES_JSON exists at the end
+    const guardedStream = new ReadableStream({
       async start(controller) {
-        controller.enqueue(encodedPreamble);
         const reader = modelStream.getReader();
+        let fullText = '';
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+          const chunk = new TextDecoder().decode(value);
+          fullText += chunk;
           controller.enqueue(value);
+        }
+        // append sources metadata if model didn't include it
+        if (!/SOURCES_JSON:/i.test(fullText)) {
+          const fallback = `\n\nSOURCES_JSON:${JSON.stringify(sources)}`;
+          controller.enqueue(new TextEncoder().encode(fallback));
+        } else {
+          // If model did include SOURCES_JSON, still ensure it's the rich `sources` object if it omitted URLs/titles
+          // (we won't attempt to patch partial model output — only add missing block)
         }
         controller.close();
       }
     });
 
-    return new StreamingTextResponse(combinedStream);
-
+    return new StreamingTextResponse(guardedStream);
   } catch (err) {
-    console.error('Error in handler:', err);
+    console.error('chat handler error:', err);
     return new Response('Internal Server Error', { status: 500 });
   }
 }
