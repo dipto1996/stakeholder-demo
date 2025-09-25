@@ -1,7 +1,4 @@
-// pages/index.js — Frontend chat UI (full file)
-// - Parses SOURCES_JSON in onFinish
-// - Strips metadata for visible output
-// - Renders sources as blue underlined links inside a shaded box
+// pages/index.js — Frontend chat UI (onFinish parsing, link rendering)
 import { useChat } from 'ai/react';
 import { useRef, useEffect, useState } from 'react';
 
@@ -13,7 +10,7 @@ export default function ChatPage() {
   const { messages, input, setInput, handleInputChange, handleSubmit, isLoading } = useChat({
     api: '/api/chat',
     onFinish: (message) => {
-      // parse SOURCES_JSON exactly once after stream completes
+      // runs after the stream finished for this message (avoids race conditions)
       const text = message.content || '';
       const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m;
       const match = text.match(sourcesRegex);
@@ -22,13 +19,12 @@ export default function ChatPage() {
           const parsed = JSON.parse(match[1]);
           setParsedSources(prev => ({ ...prev, [message.id]: parsed }));
         } catch (e) {
-          console.warn('Failed to parse SOURCES_JSON', e);
+          console.warn('Failed to parse SOURCES_JSON:', e);
         }
       }
     }
   });
 
-  // Trending / sample prompts
   useEffect(() => {
     fetch('/trending.json')
       .then(res => res.json())
@@ -36,18 +32,13 @@ export default function ChatPage() {
       .catch(() => {});
   }, []);
 
-  // Auto-scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Remove metadata blocks (SOURCES_JSON or SUGGESTED) from visible content
   function stripMetadata(content) {
     if (!content) return '';
-    return content
-      .replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m, '')
-      .replace(/SUGGESTED:\s*(\[[\s\S]*?\])\s*$/m, '')
-      .trim();
+    return content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m, '').trim();
   }
 
   const suggestedPrompts = [
@@ -74,7 +65,6 @@ export default function ChatPage() {
                 <div className={'max-w-xl p-4 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
                   <div className="whitespace-pre-wrap text-sm" dangerouslySetInnerHTML={{ __html: formatMarkdownSafe(cleaned) }} />
 
-                  {/* Sources box: subtle shade, small text, blue underlined links */}
                   {sources.length > 0 && (
                     <div className="mt-3 p-3 rounded-md bg-neutral-50 border border-neutral-100">
                       <p className="text-xs font-semibold text-neutral-600 mb-2">Sources</p>
@@ -98,7 +88,6 @@ export default function ChatPage() {
               </div>
             );
           })}
-
           <div ref={messagesEndRef} />
         </div>
       </main>
@@ -149,29 +138,19 @@ export default function ChatPage() {
   );
 }
 
-/**
- * Minimal, safe markdown-ish formatter for display:
- * - Converts simple **bold** and bullet lines into HTML
- * - Keeps text safe (very lightweight). If you use a markdown library, swap here.
- */
 function formatMarkdownSafe(text) {
   if (!text) return '';
-  // escape HTML characters
   const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
-  // basic transformations
   const lines = esc(text).split('\n');
   const out = [];
   for (const line of lines) {
     if (line.trim().startsWith('- ')) {
       out.push(`<li>${line.trim().slice(2)}</li>`);
     } else {
-      // bold **text**
       const bolded = line.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
       out.push(`<p>${bolded}</p>`);
     }
   }
-  // wrap consecutive <li> into a <ul>
   const html = out.join('');
-  // quick combine adjacent <li> into UL groups
   return html.replace(/(<li>.*?<\/li>)+/gs, (m) => `<ul class="ml-4 list-disc">${m}</ul>`);
 }
