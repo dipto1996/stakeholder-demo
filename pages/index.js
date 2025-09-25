@@ -1,12 +1,10 @@
-// index.js — Final Production-Grade Version
-// This version correctly parses the SOURCES_JSON preamble, renders rich,
-// clickable citations, and includes the Trending Topics and Suggested Prompts.
+// index.js — Final Corrected Version
+// This version moves the parsing logic directly into the render function
+// to prevent state conflicts with the `useChat` hook, fixing the silent render failure.
 import { useChat } from 'ai/react';
 import { useRef, useEffect, useState } from 'react';
 
 export default function ChatPage() {
-  // State hooks must be declared before the useChat hook
-  const [parsedSources, setParsedSources] = useState({});
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
@@ -27,26 +25,19 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Robustly parse the SOURCES_JSON preamble whenever messages change
-  useEffect(() => {
-    if (!messages || messages.length === 0) return;
-
-    const lastMessage = messages[messages.length - 1];
-    if (lastMessage.role !== 'assistant') return;
-
-    const text = lastMessage.content || '';
+  // Helper to safely parse sources from a message's content
+  const parseSources = (content) => {
     const sourcesRegex = /^SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/;
-    
-    const sourcesMatch = text.match(sourcesRegex);
+    const sourcesMatch = content.match(sourcesRegex);
     if (sourcesMatch && sourcesMatch[1]) {
       try {
-        const parsed = JSON.parse(sourcesMatch[1]);
-        setParsedSources(prev => ({ ...prev, [lastMessage.id]: parsed }));
+        return JSON.parse(sourcesMatch[1]);
       } catch (e) {
-        console.warn('Failed to parse SOURCES_JSON for message', lastMessage.id, e);
+        return null;
       }
     }
-  }, [messages]);
+    return null;
+  };
 
   // Helper to safely remove the metadata preamble from displayed content
   function stripMetadata(content) {
@@ -70,8 +61,9 @@ export default function ChatPage() {
       <main className="flex-1 overflow-y-auto p-4">
         <div className="space-y-4 max-w-3xl mx-auto">
           {messages.map((msg) => {
+            // Perform parsing directly here instead of using a separate state
+            const sources = msg.role === 'assistant' ? parseSources(msg.content) : null;
             const cleanedContent = stripMetadata(msg.content);
-            const sources = parsedSources[msg.id];
 
             return (
               <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
