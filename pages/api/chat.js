@@ -1,155 +1,86 @@
 // pages/api/chat.js
-import { OpenAIStream, StreamingTextResponse } from 'ai';
-import OpenAI from 'openai';
-import { sql } from '@vercel/postgres';
+import { OpenAIStream, StreamingTextResponse } from "ai";
+import OpenAI from "openai";
 
-export const config = { runtime: 'edge' };
+export const config = { runtime: "edge" };
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Tunables
-const EMBEDDING_MODEL = 'text-embedding-3-small';
-const CHAT_MODEL = 'gpt-4o-mini';
-const EMB_RETRIES = 3;
-const CHAT_RETRIES = 2;
-const MAX_EXCERPT_LENGTH = 1600;
-const MAX_CONTEXT_LENGTH = 6000;
+const EMB_MODEL = "text-embedding-3-small";
+const CHAT_MODEL = "gpt-4o-mini";
 
-async function createEmbeddingsWithRetry(input) {
-  for (let attempt = 0; attempt < EMB_RETRIES; attempt++) {
-    try {
-      const r = await openai.embeddings.create({ model: EMBEDDING_MODEL, input });
-      if (!r?.data?.[0]?.embedding) throw new Error('No embedding returned');
-      return r;
-    } catch (e) {
-      if (attempt === EMB_RETRIES - 1) throw e;
-      await new Promise((res) => setTimeout(res, 2 ** attempt * 1000));
-    }
-  }
-}
-
-async function createCompletionWithRetry(messages, stream = true) {
-  for (let attempt = 0; attempt < CHAT_RETRIES; attempt++) {
+// The model is instructed to append a machine-parsable SUGGESTED JSON line at the very end:
+// SUGGESTED: ["followup1", "followup2"]
+// We do NOT send a raw byte preamble here — streaming only the model response.
+async function createCompletionWithRetry(messages) {
+  const RETRIES = 2;
+  for (let attempt = 0; attempt < RETRIES; attempt++) {
     try {
       return await openai.chat.completions.create({
         model: CHAT_MODEL,
-        stream,
+        stream: true,
         messages,
         temperature: 0.15,
       });
     } catch (e) {
-      if (attempt === CHAT_RETRIES - 1) throw e;
-      await new Promise((res) => setTimeout(res, 2 ** attempt * 1000));
+      if (attempt === RETRIES - 1) throw e;
+      await new Promise((r) => setTimeout(r, 2 ** attempt * 1000));
     }
   }
 }
 
 export default async function handler(req) {
-  if (req.method !== 'POST') {
-    return new Response('Method Not Allowed', { status: 405 });
+  if (req.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405 });
   }
 
   try {
-    const body = await req.json();
-    const { messages } = body || {};
+    const { messages } = await req.json();
     if (!Array.isArray(messages) || messages.length === 0) {
-      return new Response('Invalid request body', { status: 400 });
+      return new Response("Invalid request body", { status: 400 });
     }
+    const userQuery = (messages[messages.length - 1].content || "").trim();
+    if (!userQuery) return new Response("Empty user query", { status: 400 });
 
-    const userQuery = (messages[messages.length - 1].content || '').trim();
-    if (!userQuery) return new Response('Empty user query', { status: 400 });
-
-    // Greeting shortcut: use the model rather than raw bytes so the stream format matches.
+    // Greeting shortcut (fast)
     const GREETING_RE = /^(hi|hello|hey|good morning|good afternoon|good evening)\b/i;
     if (GREETING_RE.test(userQuery)) {
-      const greetingMessages = [
-        { role: 'system', content: 'You are a friendly assistant.' },
-        { role: 'user', content: 'Say a short friendly greeting and ask how you can help with US immigration in one sentence.' },
-      ];
-      const completion = await createCompletionWithRetry(greetingMessages);
-      const modelStream = OpenAIStream(completion);
-      return new StreamingTextResponse(modelStream);
-    }
-
-    // 1) embedding
-    const embResp = await createEmbeddingsWithRetry(userQuery);
-    const queryEmbedding = embResp.data[0].embedding;
-    const embLiteral = JSON.stringify(queryEmbedding);
-
-    // 2) retrieve top-k docs (expects documents table to have source_title, source_url, content, embedding)
-    const q = await sql`
-      SELECT source_title, source_url, content
-      FROM documents
-      ORDER BY embedding <=> ${embLiteral}::vector
-      LIMIT 6
-    `;
-    const rows = q?.rows ?? [];
-
-    if (!rows || rows.length === 0) {
-      // Friendly fallback (no LLM call) — keep streaming format
-      const fallbackText = "I couldn't find supporting documents in our indexed sources for that question. Would you like (A) a broader search, (B) general guidance, or (C) lawyer review?";
-      const fallbackStream = new ReadableStream({
+      const greeting = "Hello! 👋 I can help explain U.S. immigration rules (H-1B, F-1, OPT, CPT). What would you like to know?";
+      const s = new ReadableStream({
         start(controller) {
-          controller.enqueue(new TextEncoder().encode(fallbackText));
+          controller.enqueue(new TextEncoder().encode(greeting));
           controller.close();
-        }
+        },
       });
-      return new StreamingTextResponse(fallbackStream);
+      return new StreamingTextResponse(s);
     }
 
-    // 3) Build sources (title + url) and context (trimmed)
-    const sources = rows.map((r, i) => ({
-      id: i + 1,
-      title: r.source_title || 'Untitled Source',
-      url: r.source_url || null,
-    }));
+    // Build a helpful prompt that requires the model to: (a) answer from provided context only,
+    // (b) cite sources in [1], [2] format, (c) append SUGGESTED JSON at the end for UI chips.
+    // NOTE: The frontend will fetch canonical 'sources' separately and display them as links;
+    // here we only ask the model to cite with numbers matching the provided context order.
+    const systemPrompt = `You are a friendly, professional assistant for U.S. immigration questions.
+Rules:
+- Use ONLY the CONTEXT section for factual claims. Do NOT hallucinate.
+- Cite every factual claim using bracketed numbers e.g. [1], [2] that correspond to the numbered sources.
+- Output structure: (1) Short direct answer (1-3 sentences) (2) Key points (bulleted list) (3) Next steps (1-3 items).
+- At the very end (after whitespace/newline) append a machine-parsable SUGGESTED line exactly like:
+SUGGESTED: ["prompt 1", "prompt 2"]
+- Do NOT provide legal advice. If context is insufficient, say "I couldn't find supporting official sources in the provided documents."`;
 
-    let totalChars = 0;
-    const contextParts = [];
-    for (let i = 0; i < rows.length; i++) {
-      const excerpt = (rows[i].content || '').slice(0, MAX_EXCERPT_LENGTH);
-      if (totalChars + excerpt.length > MAX_CONTEXT_LENGTH) break;
-      contextParts.push(`[${i + 1}] source_title: ${rows[i].source_title || 'Untitled'}\ncontent: ${excerpt}`);
-      totalChars += excerpt.length;
-    }
-    const contextText = contextParts.join('\n\n---\n\n');
-
-    // 4) prompts
-    const systemPrompt = `You are a friendly and professional AI assistant for U.S. immigration questions. Use ONLY the numbered sources in the CONTEXT section below to answer the user's QUESTION. Cite factual claims with [1], [2], etc. Output: (1) short answer, (2) key points (bulleted), (3) next steps. Do NOT provide legal advice. If context insufficient, say you cannot find it in the provided documents.`;
-    const userPrompt = `CONTEXT:\n${contextText}\n\nQUESTION:\n${userQuery}`;
-
+    // We expect frontend to include the contextText in the user message if needed.
+    // Here we simply use whatever messages the frontend passed through.
     const messagesForModel = [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
+      { role: "system", content: systemPrompt },
+      ...messages,
     ];
 
-    // 5) call model (stream)
-    const completion = await createCompletionWithRetry(messagesForModel, /*stream*/ true);
-    const modelStream = OpenAIStream(completion);
+    const completion = await createCompletionWithRetry(messagesForModel);
 
-    // 6) append trailing SOURCES_JSON after model stream so frontend onFinish can parse it
-    const suffix = `\n\nSOURCES_JSON:${JSON.stringify(sources)}\n`;
-    const encodedSuffix = new TextEncoder().encode(suffix);
-
-    const combined = new ReadableStream({
-      async start(controller) {
-        // pipe modelStream first
-        const reader = modelStream.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          controller.enqueue(value);
-        }
-        // then append suffix
-        controller.enqueue(encodedSuffix);
-        controller.close();
-      }
-    });
-
-    return new StreamingTextResponse(combined);
-
+    const stream = OpenAIStream(completion);
+    return new StreamingTextResponse(stream);
   } catch (err) {
-    console.error('chat handler error:', err);
-    return new Response('Internal Server Error', { status: 500 });
+    console.error("chat error:", err);
+    return new Response("Internal Server Error", { status: 500 });
   }
 }
