@@ -1,72 +1,63 @@
-// pages/index.js (React component using ai/react)
+// index.js — Final Production-Grade Version
+// This version correctly parses the SOURCES_JSON preamble, renders rich,
+// clickable citations, and includes the Trending Topics and Suggested Prompts.
 import { useChat } from 'ai/react';
 import { useRef, useEffect, useState } from 'react';
 
 export default function ChatPage() {
+  // State hooks must be declared before the useChat hook
   const [parsedSources, setParsedSources] = useState({});
-  const [parsedSuggested, setParsedSuggested] = useState({});
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
-  const { messages, input, setInput, handleInputChange, handleSubmit, append, isLoading } = useChat({
+  const { messages, input, setInput, handleInputChange, handleSubmit, isLoading } = useChat({
     api: '/api/chat',
   });
 
+  // Fetch trending topics on component mount
   useEffect(() => {
     fetch('/trending.json')
       .then(res => res.json())
       .then(data => setTrendingTopics(data))
-      .catch(() => {});
+      .catch(err => console.error("Failed to fetch trending topics:", err));
   }, []);
 
+  // Auto-scroll to the latest message
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  // Robustly parse the SOURCES_JSON preamble whenever messages change
+  useEffect(() => {
     if (!messages || messages.length === 0) return;
 
-    const last = messages[messages.length - 1];
-    if (last.role !== 'assistant') return;
+    const lastMessage = messages[messages.length - 1];
+    if (lastMessage.role !== 'assistant') return;
 
-    const text = last.content || '';
-    const sourcesRegex = /SOURCES_JSON:\s*(\[[\s\S]*?\])\s*/;
-    const suggestedRegex = /SUGGESTED:\s*(\[[\s\S]*?\])\s*/;
-
-    const sMatch = text.match(sourcesRegex);
-    if (sMatch && sMatch[1]) {
+    const text = lastMessage.content || '';
+    const sourcesRegex = /^SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/;
+    
+    const sourcesMatch = text.match(sourcesRegex);
+    if (sourcesMatch && sourcesMatch[1]) {
       try {
-        const parsed = JSON.parse(sMatch[1]);
-        setParsedSources(prev => ({ ...prev, [last.id]: parsed }));
+        const parsed = JSON.parse(sourcesMatch[1]);
+        setParsedSources(prev => ({ ...prev, [lastMessage.id]: parsed }));
       } catch (e) {
-        console.warn('SOURCES_JSON parse failed', e);
-      }
-    }
-
-    const sugMatch = text.match(suggestedRegex);
-    if (sugMatch && sugMatch[1]) {
-      try {
-        const parsed = JSON.parse(sugMatch[1]);
-        setParsedSuggested(prev => ({ ...prev, [last.id]: parsed }));
-      } catch (e) {
-        console.warn('SUGGESTED parse failed', e);
+        console.warn('Failed to parse SOURCES_JSON for message', lastMessage.id, e);
       }
     }
   }, [messages]);
 
+  // Helper to safely remove the metadata preamble from displayed content
   function stripMetadata(content) {
     if (!content) return '';
-    return content
-      .replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*/g, '')
-      .replace(/SUGGESTED:\s*(\[[\s\S]*?\])\s*/g, '')
-      .trim();
-  }
-
-  function handleSuggestedClick(prompt) {
-    append({ role: 'user', content: prompt });
+    return content.replace(/^SOURCES_JSON:\s*(\[[\s\S]*?\])\s*\n\n/, '').trim();
   }
 
   const defaultSuggestedPrompts = [
     "What are H-1B qualifications?",
     "What documents do I need for OPT travel?",
-    "Explain the F-1 OPT policy."
+    "Explain F-1 OPT policy.",
   ];
 
   return (
@@ -79,39 +70,29 @@ export default function ChatPage() {
       <main className="flex-1 overflow-y-auto p-4">
         <div className="space-y-4 max-w-3xl mx-auto">
           {messages.map((msg) => {
-            const cleaned = stripMetadata(msg.content);
+            const cleanedContent = stripMetadata(msg.content);
             const sources = parsedSources[msg.id];
-            const suggested = parsedSuggested[msg.id];
 
             return (
               <div key={msg.id} className={'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start')}>
                 <div className={'max-w-xl p-3 rounded-lg shadow-sm ' + (msg.role === 'user' ? 'bg-brand-blue text-white' : 'bg-white text-neutral-900 border border-neutral-200')}>
-                  <p className="whitespace-pre-wrap text-sm">{cleaned}</p>
+                  <p className="whitespace-pre-wrap text-sm">{cleanedContent}</p>
 
                   {sources && sources.length > 0 && (
                     <div className="mt-2 border-t border-neutral-200 pt-2">
                       <p className="text-xs font-semibold text-neutral-600 mb-1">Sources:</p>
                       <div className="space-y-1">
-                        {sources.map(src => (
-                          <div key={src.id} className="text-xs text-neutral-500">
-                            [{src.id}] {src.url ? (
-                              <a href={src.url} target="_blank" rel="noopener noreferrer" className="underline">{src.title}</a>
-                            ) : src.title}
-                            <div className="text-xs text-neutral-400">{src.excerpt}</div>
+                        {sources.map(source => (
+                          <div key={source.id} className="text-xs text-neutral-500">
+                            [{source.id}] {' '}
+                            {source.url ? (
+                              <a href={source.url} target="_blank" rel="noopener noreferrer" className="underline hover:text-brand-blue">
+                                {source.title}
+                              </a>
+                            ) : (
+                              source.title
+                            )}
                           </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {suggested && Array.isArray(suggested) && (
-                    <div className="mt-2 pt-2">
-                      <p className="text-xs font-semibold text-neutral-600 mb-1">Suggested Follow-ups:</p>
-                      <div className="flex flex-wrap gap-2">
-                        {suggested.map((p, idx) => (
-                          <button key={idx} onClick={() => handleSuggestedClick(p)} className="px-3 py-1 bg-neutral-200 text-neutral-700 text-sm rounded-full hover:bg-neutral-300 transition-colors">
-                            {p}
-                          </button>
                         ))}
                       </div>
                     </div>
