@@ -1,7 +1,11 @@
 // pages/index.js
 import { useState, useRef, useEffect } from "react";
+import { useSession } from "next-auth/react";
+import AuthButton from "../components/AuthButton";
+import ProtectedContent from "../components/ProtectedContent";
 
 export default function ChatPage() {
+  const { data: session } = useSession();
   const [messages, setMessages] = useState([]); // { role: 'user'|'assistant', content, sources? }
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -71,46 +75,77 @@ export default function ChatPage() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", fontFamily: "Inter, sans-serif" }}>
-      <header style={{ padding: 16, borderBottom: "1px solid #eee", background: "#fff" }}>
-        <h2 style={{ margin: 0 }}>Immigration AI Assistant</h2>
-        <div style={{ color: "#666", fontSize: 13 }}>Informational only — not legal advice</div>
+      <header style={{ padding: 16, borderBottom: "1px solid #eee", background: "#fff", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <h2 style={{ margin: 0 }}>Immigration AI Assistant</h2>
+          <div style={{ color: "#666", fontSize: 13 }}>Informational only — not legal advice</div>
+        </div>
+        <AuthButton />
       </header>
 
       <main style={{ flex: 1, overflow: "auto", padding: 20 }}>
-        <div style={{ maxWidth: 900, margin: "0 auto" }}>
-          {messages.map((m, idx) => (
-            <div key={idx} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start", marginBottom: 12 }}>
-              <div style={{
-                maxWidth: "75%",
-                padding: 12,
-                borderRadius: 8,
-                background: m.role === "user" ? "#0b63d8" : "#fff",
-                color: m.role === "user" ? "#fff" : "#111",
-                boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
-                border: m.role === "assistant" ? "1px solid #eee" : "none"
-              }}>
-                <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.45 }}>{m.content}</div>
-                {m.role === "assistant" && renderSources(m.sources)}
+        <ProtectedContent 
+          fallback={
+            <div style={{ maxWidth: 900, margin: "0 auto", textAlign: "center", padding: "40px 20px" }}>
+              <h3 style={{ fontSize: "24px", marginBottom: "16px", color: "#333" }}>
+                Welcome to Immigration AI Assistant
+              </h3>
+              <p style={{ color: "#666", marginBottom: "24px", lineHeight: 1.6 }}>
+                Please sign in with your Google account to start asking questions about U.S. immigration.
+              </p>
+              <div style={{ display: "flex", justifyContent: "center" }}>
+                <AuthButton />
               </div>
             </div>
-          ))}
-          <div ref={endRef} />
-        </div>
+          }
+        >
+          <div style={{ maxWidth: 900, margin: "0 auto" }}>
+            {session && (
+              <div style={{ marginBottom: "20px", padding: "12px", background: "#f0f9ff", borderRadius: "8px", border: "1px solid #bae6fd" }}>
+                <div style={{ fontSize: "14px", color: "#0369a1", fontWeight: "500" }}>
+                  Welcome back, {session.user.name || session.user.email}! 
+                </div>
+                <div style={{ fontSize: "12px", color: "#0284c7", marginTop: "4px" }}>
+                  You can now ask questions about U.S. immigration policies and procedures.
+                </div>
+              </div>
+            )}
+            {messages.map((m, idx) => (
+              <div key={idx} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start", marginBottom: 12 }}>
+                <div style={{
+                  maxWidth: "75%",
+                  padding: 12,
+                  borderRadius: 8,
+                  background: m.role === "user" ? "#0b63d8" : "#fff",
+                  color: m.role === "user" ? "#fff" : "#111",
+                  boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
+                  border: m.role === "assistant" ? "1px solid #eee" : "none"
+                }}>
+                  <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.45 }}>{m.content}</div>
+                  {m.role === "assistant" && renderSources(m.sources)}
+                </div>
+              </div>
+            ))}
+            <div ref={endRef} />
+          </div>
+        </ProtectedContent>
       </main>
 
       <footer style={{ padding: 16, borderTop: "1px solid #eee", background: "#fff" }}>
-        <form onSubmit={handleSubmit} style={{ maxWidth: 900, margin: "0 auto", display: "flex", gap: 8 }}>
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask a question about U.S. immigration..."
-            style={{ flex: 1, padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd" }}
-            disabled={loading}
-          />
-          <button type="submit" disabled={loading} style={{ padding: "10px 14px", borderRadius: 8, background: "#0b63d8", color: "#fff", border: "none" }}>
-            {loading ? "Thinking..." : "Send"}
-          </button>
-        </form>
+        <ProtectedContent>
+          <form onSubmit={handleSubmit} style={{ maxWidth: 900, margin: "0 auto", display: "flex", gap: 8 }}>
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="Ask a question about U.S. immigration..."
+              style={{ flex: 1, padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd" }}
+              disabled={loading}
+            />
+            <button type="submit" disabled={loading} style={{ padding: "10px 14px", borderRadius: 8, background: "#0b63d8", color: "#fff", border: "none" }}>
+              {loading ? "Thinking..." : "Send"}
+            </button>
+          </form>
+        </ProtectedContent>
       </footer>
     </div>
   );
