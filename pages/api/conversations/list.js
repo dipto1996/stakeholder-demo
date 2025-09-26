@@ -1,33 +1,34 @@
-// Returns latest conversations for the signed-in user.
-import { getServerSession } from 'next-auth/next';
-import { authOptions } from '../auth/[...nextauth]';
+// pages/api/conversations/list.js
+export const config = { runtime: 'nodejs' };
+
 import { sql } from '@vercel/postgres';
+import { getServerSession } from 'next-auth';
+import { authOptions } from '../auth/[...nextauth]';
 
-export const config = { runtime: 'edge' };
-
-export default async function handler(req) {
-  if (req.method !== 'GET') return new Response('Method Not Allowed', { status: 405 });
+export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method Not Allowed' });
+  }
 
   try {
-    const session = await getServerSession({ req, ...authOptions });
-    if (!session?.user?.email) return new Response('Unauthorized', { status: 401 });
+    const session = await getServerSession(req, res, authOptions);
+    if (!session?.user?.email) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
 
-    const { rows: userRows } = await sql`SELECT id FROM users WHERE email = ${session.user.email} LIMIT 1`;
-    if (userRows.length === 0) return new Response(JSON.stringify([]), { status: 200 });
-
-    const userId = userRows[0].id;
-
+    // Fetch the user’s conversations (lightweight list)
     const { rows } = await sql`
-      SELECT id, title, created_at
-      FROM conversations
-      WHERE user_id = ${userId}
-      ORDER BY created_at DESC
-      LIMIT 25
+      SELECT c.id, c.title, c.created_at
+      FROM conversations c
+      JOIN users u ON u.id = c.user_id
+      WHERE u.email = ${session.user.email}
+      ORDER BY c.created_at DESC
+      LIMIT 50
     `;
 
-    return new Response(JSON.stringify(rows), { status: 200, headers: { 'Content-Type': 'application/json' } });
-  } catch (e) {
-    console.error('list conversations error:', e);
-    return new Response('Internal Server Error', { status: 500 });
+    return res.status(200).json({ ok: true, conversations: rows });
+  } catch (err) {
+    console.error('list conversations error:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 }
