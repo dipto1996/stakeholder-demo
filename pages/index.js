@@ -1,91 +1,76 @@
-// pages/index.js — Chat UI with sources + save-to-history on finish
+// pages/index.js — Client-only + robust rendering + sources block
+import dynamic from 'next/dynamic';
 import { useChat } from 'ai/react';
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useEffect, useState } from 'react';
 import { useSession } from 'next-auth/react';
-import AuthButtons from '../components/AuthButtons';
+import AuthButtons from '../components/authbuttons';
 
-export default function ChatPage() {
-  const { data: session } = useSession();
+function ChatPageInner() {
+  const { data: session, status } = useSession();
   const [parsedSources, setParsedSources] = useState({});
   const [trendingTopics, setTrendingTopics] = useState([]);
   const messagesEndRef = useRef(null);
 
+  // useChat for streaming chat UI
   const {
-    messages,
-    input,
+    messages = [],
+    input = '',
     setInput,
-    handleInputChange,
-    handleSubmit,
-    isLoading,
+    handleInputChange = () => {},
+    handleSubmit = () => {},
+    isLoading = false,
   } = useChat({
     api: '/api/chat',
-    onFinish: async (message) => {
-      // 1) Parse sources appended by the backend (SOURCES_JSON:[...])
+    onFinish: (message) => {
+      // Parse SOURCES_JSON from the model text (your current working format)
       try {
-        const text = message?.content || '';
-        const m = text.match(/SOURCES_JSON:\s*(\[[\s\S]*?\])/);
+        const text = message?.content ?? '';
+        const m = text.match(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m);
         if (m && m[1]) {
           const sources = JSON.parse(m[1]);
           setParsedSources((prev) => ({ ...prev, [message.id]: sources }));
         }
       } catch (e) {
-        console.warn('Failed to parse sources JSON:', e);
-      }
-
-      // 2) Save conversation to DB for signed-in users
-      if (session?.user?.email) {
-        try {
-          await fetch('/api/conversations/save', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              messages, // full array (user + assistant)
-              // optional: title (backend auto-generates if omitted)
-            }),
-          });
-        } catch (e) {
-          console.warn('Save conversation failed:', e);
-        }
+        console.warn('SOURCES_JSON parse failed:', e);
       }
     },
   });
 
-  // Optional: fetch trending topics (shown before first message)
+  // Fetch trending topics (non-blocking)
   useEffect(() => {
+    let alive = true;
     fetch('/trending.json')
-      .then((res) => res.json())
-      .then((data) => setTrendingTopics(data))
+      .then((r) => (r.ok ? r.json() : []))
+      .then((data) => { if (alive) setTrendingTopics(Array.isArray(data) ? data : []); })
       .catch(() => {});
+    return () => { alive = false; };
   }, []);
 
-  // Auto-scroll on new message
+  // Auto-scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Hide the raw metadata in the visible message text
-  function stripMetadata(content) {
-    if (!content) return '';
-    return content.replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m, '').trim();
-  }
+  // Remove metadata tail from display
+  const stripMetadata = (content) =>
+    (content || '').replace(/SOURCES_JSON:\s*(\[[\s\S]*?\])\s*$/m, '').trim();
 
-  const defaultSuggestedPrompts = [
-    'What are H-1B qualifications?',
-    'What documents do I need for OPT travel?',
-    'Explain F-1 OPT policy.',
-  ];
+  // Loading session (don’t blank screen)
+  if (status === 'loading') {
+    return (
+      <div className="flex items-center justify-center h-screen text-neutral-600">
+        Loading…
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-screen bg-neutral-50 font-sans">
       <header className="p-4 border-b bg-white shadow-sm">
         <div className="max-w-5xl mx-auto flex items-center justify-between">
           <div>
-            <h1 className="text-xl font-semibold text-neutral-900">
-              Immigration AI Assistant
-            </h1>
-            <p className="text-sm text-neutral-500">
-              Informational Tool — Not Legal Advice
-            </p>
+            <h1 className="text-xl font-semibold text-neutral-900">Immigration AI Assistant</h1>
+            <p className="text-sm text-neutral-500">Informational Tool — Not Legal Advice</p>
           </div>
           <AuthButtons />
         </div>
@@ -93,6 +78,7 @@ export default function ChatPage() {
 
       <main className="flex-1 overflow-y-auto p-4">
         <div className="space-y-4 max-w-3xl mx-auto">
+          {/* If not signed in, still allow chat, just no history — your preference */}
           {messages.map((msg) => {
             const cleaned = stripMetadata(msg.content);
             const sources = parsedSources[msg.id];
@@ -106,35 +92,33 @@ export default function ChatPage() {
                   className={
                     'max-w-xl p-3 rounded-lg shadow-sm ' +
                     (msg.role === 'user'
-                      ? 'bg-brand-blue text-white'
+                      ? 'bg-blue-600 text-white'
                       : 'bg-white text-neutral-900 border border-neutral-200')
                   }
                 >
-                  <p className="whitespace-pre-wrap text-sm">{cleaned}</p>
+                  <div className="prose prose-sm max-w-none">
+                    <p className="whitespace-pre-wrap">{cleaned}</p>
+                  </div>
 
-                  {/* Sources panel (assistant messages only) */}
-                  {msg.role === 'assistant' && sources && sources.length > 0 && (
-                    <div className="mt-3 border-t border-neutral-200 pt-2 bg-neutral-50/60 rounded-md">
-                      <p className="text-xs font-semibold text-neutral-700 mb-1">
-                        Sources
-                      </p>
+                  {/* Sources block */}
+                  {sources && Array.isArray(sources) && sources.length > 0 && (
+                    <div className="mt-3 rounded-md border border-blue-100 bg-blue-50 p-2">
+                      <p className="text-xs font-semibold text-blue-800 mb-1">Sources</p>
                       <ul className="space-y-1">
                         {sources.map((s) => (
-                          <li key={s.id} className="text-xs">
-                            <span className="text-neutral-500 mr-1">[{s.id}]</span>
+                          <li key={s.id} className="text-xs text-blue-700">
+                            <span className="font-mono">[{s.id}] </span>
                             {s.url ? (
                               <a
+                                className="underline"
                                 href={s.url}
                                 target="_blank"
                                 rel="noopener noreferrer"
-                                className="underline text-blue-700 hover:text-blue-900"
                               >
                                 {s.title || 'Source'}
                               </a>
                             ) : (
-                              <span className="text-neutral-700">
-                                {s.title || 'Source'}
-                              </span>
+                              <span>{s.title || 'Source'}</span>
                             )}
                           </li>
                         ))}
@@ -155,54 +139,46 @@ export default function ChatPage() {
             <>
               {trendingTopics.length > 0 && (
                 <div className="mb-4">
-                  <h3 className="text-sm font-semibold text-neutral-700 mb-2">
-                    Trending Topics
-                  </h3>
+                  <h3 className="text-sm font-semibold text-neutral-700 mb-2">Trending Topics</h3>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-                    {trendingTopics.map((topic, i) => (
+                    {trendingTopics.map((t, i) => (
                       <div
                         key={i}
                         className="p-3 bg-neutral-100 rounded-md border border-neutral-200"
                       >
-                        <p className="font-semibold text-sm text-neutral-900">
-                          {topic.title}
-                        </p>
-                        <p className="text-xs text-neutral-500">{topic.blurb}</p>
+                        <p className="font-semibold text-sm text-neutral-900">{t.title}</p>
+                        <p className="text-xs text-neutral-500">{t.blurb}</p>
                       </div>
                     ))}
                   </div>
                 </div>
               )}
-
-              <div className="mb-3 flex flex-wrap gap-2">
-                {defaultSuggestedPrompts.map((p, i) => (
-                  <button
-                    key={i}
-                    onClick={() => setInput(p)}
-                    className="px-3 py-1 bg-neutral-200 text-neutral-700 text-sm rounded-full hover:bg-neutral-300 transition-colors"
-                  >
-                    {p}
-                  </button>
-                ))}
-              </div>
             </>
           )}
 
-          <form onSubmit={handleSubmit}>
+          <form
+            onSubmit={(e) => {
+              try {
+                handleSubmit(e);
+              } catch (err) {
+                console.error('submit error', err);
+              }
+            }}
+          >
             <div className="flex space-x-2">
               <input
                 value={input}
                 onChange={handleInputChange}
-                placeholder="Ask a question about U.S. immigration..."
-                className="flex-1 p-2 border border-neutral-200 rounded-md focus:ring-2 focus:ring-brand-blue focus:outline-none"
+                placeholder="Ask a question about U.S. immigration…"
+                className="flex-1 p-2 border border-neutral-200 rounded-md focus:ring-2 focus:ring-blue-600 focus:outline-none"
                 disabled={isLoading}
               />
               <button
                 type="submit"
                 disabled={isLoading}
-                className="px-4 py-2 bg-brand-blue text-white font-semibold rounded-md disabled:bg-gray-400 hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-brand-blue transition-colors"
+                className="px-4 py-2 bg-blue-600 text-white font-semibold rounded-md disabled:bg-gray-400 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-600 transition-colors"
               >
-                Send
+                {isLoading ? 'Sending…' : 'Send'}
               </button>
             </div>
           </form>
@@ -211,3 +187,7 @@ export default function ChatPage() {
     </div>
   );
 }
+
+// IMPORTANT: disable SSR to avoid hydration/Edge mismatches after auth integration
+const ChatPage = dynamic(() => Promise.resolve(ChatPageInner), { ssr: false });
+export default ChatPage;
