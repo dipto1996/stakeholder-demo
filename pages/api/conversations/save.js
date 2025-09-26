@@ -1,41 +1,47 @@
-// pages/api/conversations/save.js
-import { sql } from '@vercel/postgres';
+// Saves the latest conversation for the signed-in user.
+// Expects: { messages, title? }
 import { getServerSession } from 'next-auth/next';
 import { authOptions } from '../auth/[...nextauth]';
+import { sql } from '@vercel/postgres';
 
-export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
+export const config = { runtime: 'edge' };
+
+export default async function handler(req) {
+  if (req.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
 
   try {
-    const session = await getServerSession(req, res, authOptions);
-    if (!session?.user?.email) return res.status(401).json({ error: 'Not authenticated' });
+    // Need user session
+    const session = await getServerSession({ req, ...authOptions });
+    if (!session?.user?.email) return new Response('Unauthorized', { status: 401 });
 
-    const { title, messages } = req.body || {};
+    const { messages, title } = await req.json();
     if (!Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({ error: 'messages required' });
+      return new Response('messages required', { status: 400 });
     }
 
-    // lookup/create user row by email
-    const { rows: userRows } = await sql`
+    // Find (or create) the user
+    const userRes = await sql`
       INSERT INTO users (email)
       VALUES (${session.user.email})
       ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-      RETURNING id;
+      RETURNING id
     `;
-    const userId = userRows[0].id;
+    const userId = userRes.rows[0].id;
 
-    // default title: first 60 chars of the first user message
-    const firstUserMsg = messages.find(m => m.role === 'user')?.content || 'Conversation';
-    const safeTitle = (title || firstUserMsg).slice(0, 60);
+    // Default title = first user message (trimmed)
+    const derivedTitle =
+      title ||
+      (messages.find(m => m.role === 'user')?.content || 'Conversation')
+        .slice(0, 80);
 
     await sql`
-      INSERT INTO conversations (user_id, title, messages)
-      VALUES (${userId}, ${safeTitle}, ${JSON.stringify(messages)}::jsonb)
+      INSERT INTO conversations (user_id, title, messages, created_at)
+      VALUES (${userId}, ${derivedTitle}, ${JSON.stringify(messages)}::jsonb, now())
     `;
 
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    console.error('save conversation error:', err);
-    return res.status(500).json({ error: 'Internal Server Error' });
+    return new Response('OK', { status: 200 });
+  } catch (e) {
+    console.error('save conversation error:', e);
+    return new Response('Internal Server Error', { status: 500 });
   }
 }
