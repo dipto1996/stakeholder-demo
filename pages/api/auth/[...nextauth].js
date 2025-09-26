@@ -1,4 +1,9 @@
 // pages/api/auth/[...nextauth].js
+
+// Force Node.js runtime for NextAuth (Edge runtime will crash)
+export const config = { runtime: 'nodejs' };
+
+
 import NextAuth from "next-auth";
 import GoogleProvider from "next-auth/providers/google";
 
