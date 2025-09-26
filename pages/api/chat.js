@@ -1,117 +1,107 @@
-// pages/api/chat.js
-import OpenAI from "openai";
-import { sql } from "@vercel/postgres";
+// pages/api/chat.js — JSON response for your working UI
+import OpenAI from 'openai';
+import { sql } from '@vercel/postgres';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+// optional: use Edge if you want, but Node.js is fine with NextAuth in the app too
+export const config = { runtime: 'edge' };
+
+const EMBEDDING_MODEL = 'text-embedding-3-small';
+const CHAT_MODEL = 'gpt-4o-mini';
+const MAX_EXCERPT = 1600;
+const MAX_CONTEXT_TOTAL = 6000;
+
+async function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+export default async function handler(req) {
+  if (req.method !== 'POST') return json({ error: 'Method Not Allowed' }, 405);
 
   try {
-    const { messages } = req.body || {};
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({ error: "messages required" });
-    }
+    const { messages } = await req.json();
+    const userQuery = (messages?.[messages.length - 1]?.content || '').trim();
+    if (!userQuery) return json({ error: 'Empty user query' }, 400);
 
-    const userQuery = (messages[messages.length - 1].content || "").trim();
-    if (!userQuery) return res.status(400).json({ error: "empty user query" });
-
-    // Quick greeting shortcut (cheap)
-    const GREETING_RE = /^(hi|hello|hey|good morning|good afternoon|good evening)\b/i;
-    if (GREETING_RE.test(userQuery)) {
-      return res.status(200).json({
-        answer: "Hello! 👋 I can help explain U.S. immigration rules (H-1B, F-1, OPT, CPT). What would you like to know?",
-        sources: []
+    // Friendly greeting path — still JSON so UI renders it
+    if (/^(hi|hello|hey|good (morning|afternoon|evening))\b/i.test(userQuery)) {
+      return json({
+        answer:
+          'Hello! How can I help with your U.S. immigration questions today?',
+        sources: [],
       });
     }
 
-    // 1) Create embedding for query
-    const embResp = await openai.embeddings.create({
-      model: "text-embedding-3-small",
+    // 1) Embed query
+    const emb = await openai.embeddings.create({
+      model: EMBEDDING_MODEL,
       input: userQuery,
     });
-    const queryEmbedding = embResp?.data?.[0]?.embedding;
-    if (!queryEmbedding) throw new Error("Embedding failed");
+    const queryEmbedding = emb.data[0].embedding;
 
-    const embLiteral = JSON.stringify(queryEmbedding);
-
-    // 2) Retrieve top documents (assumes documents table has source_title, source_url, content, embedding)
-    const q = await sql`
-      SELECT source_title, source_url, content
+    // 2) Top-k retrieval with citation fields
+    const { rows } = await sql`
+      SELECT content, source_title, source_url
       FROM documents
-      ORDER BY embedding <=> ${embLiteral}::vector
-      LIMIT 5
+      ORDER BY embedding <=> ${JSON.stringify(queryEmbedding)}::vector
+      LIMIT 6
     `;
-    const rows = q?.rows ?? [];
 
-    // If no docs found, return helpful fallback (no LLM cost)
-    if (!rows.length) {
-      return res.status(200).json({
-        answer: "I couldn't find supporting documents in our indexed sources for that question. Would you like me to answer more generally or run a broader search?",
-        sources: []
+    if (!rows || rows.length === 0) {
+      return json({
+        answer:
+          "I couldn't find supporting official sources in the provided documents. Want me to try a broader search?",
+        sources: [],
       });
     }
 
-    // 3) Build a trimmed context for the model
-    const MAX_EXCERPT = 1200;
-    const MAX_CONTEXT_TOTAL = 4000;
-    let total = 0;
+    // Build sources list for UI
+    const sources = rows.map((r, i) => ({
+      id: i + 1,
+      title: r.source_title || 'Untitled Source',
+      url: r.source_url || null,
+    }));
+
+    // Build limited context
+    let tot = 0;
     const parts = [];
-    const sources = [];
     for (let i = 0; i < rows.length; i++) {
-      const title = rows[i].source_title || `Source ${i + 1}`;
-      const url = rows[i].source_url || null;
-      const excerpt = (rows[i].content || "").slice(0, MAX_EXCERPT);
-      if (total + excerpt.length > MAX_CONTEXT_TOTAL) break;
-      total += excerpt.length;
-      parts.push(`[${i + 1}] ${title}\n${excerpt}`);
-      sources.push({ id: i + 1, title, url });
+      const excerpt = (rows[i].content || '').slice(0, MAX_EXCERPT);
+      if (tot + excerpt.length > MAX_CONTEXT_TOTAL) break;
+      parts.push(`[${i + 1}] ${rows[i].source_title || 'Source'}\n${excerpt}`);
+      tot += excerpt.length;
     }
-    const contextText = parts.join("\n\n---\n\n");
+    const contextText = parts.join('\n\n---\n\n');
 
-    // 4) Ask LLM (non-streaming)
-    const systemPrompt = `You are a friendly and accurate assistant for U.S. immigration questions.
-Only use the CONTEXT below for factual claims. Cite sources inline with [1], [2], etc.
-If context is insufficient, say you cannot find the answer in the provided documents. Do NOT give legal advice.
-Structure response: short direct answer, key points (bullets), next steps.`;
-    const userPrompt = `CONTEXT:
-${contextText}
+    // 3) Ask the model (non-streaming) — return only the answer text
+    const systemPrompt =
+      'You are a friendly, careful assistant for U.S. immigration. ' +
+      'Use ONLY the CONTEXT below for factual claims and cite with [1],[2]. ' +
+      'Structure: short answer, key points (bullets), next steps. Do not provide legal advice.';
+    const userPrompt = `CONTEXT:\n${contextText}\n\nQUESTION:\n${userQuery}`;
 
-QUESTION:
-${userQuery}`;
-
-    // robust extraction for different SDK shapes
     const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt }
-      ],
+      model: CHAT_MODEL,
+      stream: false,
       temperature: 0.15,
-      max_tokens: 800,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
     });
 
-    // Extract text responsibly (supports several SDK response shapes)
-    let answerText = "";
-    if (completion?.choices?.[0]?.message?.content) {
-      answerText = completion.choices[0].message.content;
-    } else if (completion?.output?.[0]?.content?.[0]?.text) {
-      answerText = completion.output[0].content[0].text;
-    } else if (typeof completion === "string") {
-      answerText = completion;
-    } else {
-      // last resort: stringify entire response (for debugging)
-      answerText = JSON.stringify(completion);
-    }
+    const answer =
+      completion.choices?.[0]?.message?.content?.trim() ||
+      'Sorry — I could not generate an answer.';
 
-    // 5) Return JSON with answer & structured sources
-    return res.status(200).json({
-      answer: answerText,
-      sources
-    });
-
+    // 4) Return plain JSON for your working UI
+    return json({ answer, sources });
   } catch (err) {
-    console.error("API error:", err);
-    return res.status(500).json({ error: err.message || "Internal Server Error" });
+    console.error('chat error:', err);
+    return json({ error: 'Internal Server Error' }, 500);
   }
 }
