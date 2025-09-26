@@ -2,7 +2,7 @@
 import { useChat } from 'ai/react';
 import { useEffect, useRef, useState } from 'react';
 import { useSession } from 'next-auth/react';
-import AuthButtons from '../components/authbuttons';
+import AuthButtons from '../components/AuthButtons';
 
 export default function ChatPage() {
   const { data: session } = useSession();
