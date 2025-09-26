@@ -15,7 +15,8 @@
     "@vercel/postgres": "^0.9.0",
     "react": "^18",
     "react-dom": "^18",
-    "next-auth": "^4.24.6"
+    "next-auth": "^4.24.6",
+    "bcryptjs": "^2.4.3"
   },
   "devDependencies": {
     "autoprefixer": "^10.4.19",
