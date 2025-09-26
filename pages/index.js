@@ -3,7 +3,7 @@ import dynamic from 'next/dynamic';
 import { useChat } from 'ai/react';
 import { useRef, useEffect, useState } from 'react';
 import { useSession } from 'next-auth/react';
-import AuthButtons from '../components/authbuttons';
+import AuthButtons from '../components/AuthButtons';
 
 function ChatPageInner() {
   const { data: session, status } = useSession();
