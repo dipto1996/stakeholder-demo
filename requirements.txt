@@ -3,6 +3,10 @@ requests
 beautifulsoup4
 gspread
 google-api-python-client
+google-auth-httplib2
+oauth2client
 python-dotenv
 psycopg2-binary
 openai
+sentence-transformers
+pandas
