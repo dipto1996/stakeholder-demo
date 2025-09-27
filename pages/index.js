@@ -7,7 +7,6 @@ import { useState, useRef, useEffect } from "react";
    - "- " lists
    - simple tables that start with "|"
    - newline -> <br/>
-   NOTE: lightweight and safe (escapes HTML)
    --------------------------- */
 
 function simpleMarkdownToHtml(md = "") {
@@ -58,9 +57,6 @@ function simpleMarkdownToHtml(md = "") {
   return out.join("\n");
 }
 
-/* Convert markdown-style table lines (array of strings) to HTML table.
-   Very forgiving: first row -> header; optional separator row like |---|---| is skipped.
-*/
 function markdownTableToHtml(tblLines = []) {
   if (!tblLines || tblLines.length === 0) return "";
 
@@ -99,62 +95,69 @@ export default function ChatPage() {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Maximum number of messages (turns) to send to backend (keeps token usage bounded)
+  const MAX_HISTORY_TURNS = 8;
+
   async function handleSubmit(e) {
     e?.preventDefault();
     const text = (input || "").trim();
     if (!text) return;
 
-    // append user message
+    // Build the new message object
     const userMsg = { role: "user", content: text };
+
+    // Build payload messages: take the last MAX_HISTORY_TURNS turns from current messages,
+    // then append the new user message. This ensures backend sees conversation history.
+    const recent = (messages || []).slice(-MAX_HISTORY_TURNS);
+    const payloadMessages = [...recent, userMsg];
+
+    // Echo the user's message into UI immediately
     setMessages((m) => [...m, userMsg]);
     setInput("");
     setLoading(true);
 
     try {
+      // Debug: inspect the outgoing payload (remove in production)
+      console.log("Sending to /api/chat payloadMessages:", payloadMessages);
+
       const resp = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: [{ role: "user", content: text }] }),
+        body: JSON.stringify({ messages: payloadMessages }),
       });
 
-      // read response JSON (may throw if non-JSON returned)
-      const data = await resp.json();
-      console.log("API /api/chat response:", data); // useful for debugging
+      // attempt to parse JSON
+      const data = await resp.json().catch(() => null);
 
       if (!resp.ok) {
-        throw new Error(data?.error || resp.statusText || "API error");
+        // If server returned non-JSON error, try to present a friendly message
+        const errMsg = (data && data.error) ? data.error : `Status ${resp.status} - ${resp.statusText}`;
+        throw new Error(errMsg);
       }
 
-      // Normalize the server shapes:
-      // - { path: "rag", rag: { answer, sources } }
-      // - { path: "fallback", answer, sources OR fallback_links }
-      // - { path: "greet", rag: { answer } }
-      // - legacy: { answer, sources }
+      // Normalize backend shapes (rag / fallback / greet / legacy)
       if (data.path === "rag" && data.rag) {
         setMessages((m) => [...m, { role: "assistant", content: data.rag.answer || "", path: "rag", sources: data.rag.sources || [] }]);
       } else if (data.path === "greet" && data.rag) {
         setMessages((m) => [...m, { role: "assistant", content: data.rag.answer || "", path: "greet", sources: data.rag.sources || [] }]);
       } else if (data.path === "fallback") {
-        // Prefer server-supplied 'sources' if present; otherwise map 'fallback_links' ->
-        // sources expected format: [{ id, title, url, ok, status }]
+        // Map fallback_links or sources -> sources array for UI
         const fromSources = data.sources && Array.isArray(data.sources) && data.sources.length > 0;
         const links = fromSources ? data.sources : (data.fallback_links || data.fallbackLinks || []);
         const sources = Array.isArray(links)
           ? links.map((l, idx) => {
               if (!l) return null;
               if (typeof l === "string") return { id: idx + 1, title: l, url: l };
-              // l may be { url, ok, status } or { title, url, excerpt }
               return { id: idx + 1, title: l.title || l.url || l, url: l.url || null, ok: l.ok, status: l.status, excerpt: l.excerpt };
             }).filter(Boolean)
           : [];
 
         setMessages((m) => [...m, { role: "assistant", content: data.answer || "", path: "fallback", sources }]);
       } else if (data.answer && Array.isArray(data.sources)) {
-        // legacy shape: use 'sources' if present; otherwise fallback
         const path = data.sources && data.sources.length > 0 ? "rag" : "fallback";
         setMessages((m) => [...m, { role: "assistant", content: data.answer || "", path, sources: data.sources || [] }]);
       } else {
-        // unknown shape — render raw
+        // Unknown shape — show raw
         setMessages((m) => [...m, { role: "assistant", content: JSON.stringify(data), path: "fallback", sources: [] }]);
       }
     } catch (err) {
@@ -238,7 +241,7 @@ export default function ChatPage() {
           {/* Message content */}
           <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.45 }} dangerouslySetInnerHTML={{ __html: simpleMarkdownToHtml(m.content || "") }} />
 
-          {/* Sources (works for both RAG and fallback since we map fallback links into sources) */}
+          {/* Sources (works for both RAG and fallback) */}
           {!isUser && m.sources && m.sources.length > 0 && (
             <div style={{ marginTop: 8 }}>
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
