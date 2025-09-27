@@ -17,7 +17,7 @@ function badRequest(msg) {
   return new Response(JSON.stringify({ error: msg }), { status: 400, headers: { "Content-Type": "application/json" } });
 }
 
-// Lightweight synthesis missing markers
+// Detect phrases the synthesizer uses to indicate missing coverage
 function synthesisHasMissingMarkers(text) {
   if (!text) return true;
   const low = text.toLowerCase();
@@ -34,7 +34,7 @@ function synthesisHasMissingMarkers(text) {
   return markers.some((m) => low.includes(m));
 }
 
-// Verify URLs (HEAD), with fallback to GET
+// Verify URLs (HEAD) — with GET fallback
 async function verifyUrls(urls = []) {
   const results = [];
   for (const u of urls) {
@@ -55,35 +55,42 @@ async function verifyUrls(urls = []) {
 
 /**
  * numericEvidenceCheck(answerText, docs)
- * - Extracts numeric tokens / currency from answerText (e.g., "$100,000", "100000", "2025")
- * - Checks whether any of the docs' excerpts contain those same numeric tokens.
- * - If answer contains numeric/currency claims but none are found in docs => returns false (no evidence).
- * - Otherwise returns true (evidence exists or no numeric claims present).
- *
- * This helps catch cases where the model invents a fee or date but the retrieved sources don't contain it.
+ * Look for numeric/currency tokens in the answer and ensure at least one token appears in the retrieved docs.
+ * If numeric claims present but not found in docs => return false (no evidence).
+ * Otherwise return true.
  */
 function numericEvidenceCheck(answerText = "", docs = []) {
-  if (!answerText) return false; // no answer => treat as missing
-  // find dollar amounts and plain numbers (years or large numbers)
+  if (!answerText) return false;
   const currencyMatches = Array.from(new Set([...answerText.matchAll(/\$\s?[\d,]+(?:\.\d+)?/g)].map(m => m[0].replace(/\s+/g, ""))));
   const plainNumberMatches = Array.from(new Set([...answerText.matchAll(/\b\d{4}\b|\b\d{3,}\b/g)].map(m => m[0])));
 
   const numericCandidates = [...currencyMatches, ...plainNumberMatches].map(s => s.replace(/[,]/g, "").toLowerCase());
   if (numericCandidates.length === 0) return true; // no numeric claims => OK
 
-  // Normalize docs text and check for presence of numeric tokens
   const lowerDocs = docs.map(d => (d.content || "").replace(/[,]/g, "").toLowerCase());
   for (const token of numericCandidates) {
     for (const dtext of lowerDocs) {
       if (!dtext) continue;
-      if (dtext.includes(token)) return true; // evidence found
-      // sometimes $ is absent in source but number present with whitespace/punctuation; check digits-only
+      if (dtext.includes(token)) return true;
       const digitsOnly = token.replace(/\D/g, "");
       if (digitsOnly && dtext.includes(digitsOnly)) return true;
     }
   }
-  // none of the numeric tokens are present in any doc excerpt
   return false;
+}
+
+/**
+ * Remove URLs and a trailing "URLs:" block from a text. Returns { cleanedText, urlsInText }.
+ * We use this to keep fallback answer body clean and move links into fallback_links.
+ */
+function stripUrlsFromText(text = "") {
+  const urlRegex = /\bhttps?:\/\/[^\s)]+/gi;
+  const urls = Array.from(new Set((text.match(urlRegex) || []).map(u => u.replace(/[),.]*$/, ""))));
+  // remove URLs and any leading "URLs:" section lines
+  let cleaned = text.replace(urlRegex, "").replace(/URLs?:\s*\n?([\s\S]*)$/i, "").trim();
+  // remove multiple blank lines
+  cleaned = cleaned.replace(/\n{2,}/g, "\n\n").trim();
+  return { cleanedText: cleaned, urlsInText: urls };
 }
 
 export default async function handler(req) {
@@ -97,7 +104,7 @@ export default async function handler(req) {
     const userQuery = (messages[messages.length - 1].content || "").trim();
     if (!userQuery) return badRequest("Empty user query");
 
-    // quick greeting path
+    // quick greeting path — return as a 'greet' path so frontend won't label it fallback
     if (/^(hi|hello|hey|good (morning|afternoon|evening))\b/i.test(userQuery)) {
       const greetResp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
@@ -109,24 +116,40 @@ export default async function handler(req) {
         temperature: 0.2,
       });
       const greet = greetResp?.choices?.[0]?.message?.content?.trim() || "Hello! How can I help?";
-      return okJSON({ answer: greet, sources: [] });
+      // return in rag-shaped object with a 'greet' path so UI doesn't show fallback disclaimer
+      return okJSON({
+        rag: { answer: greet, sources: [] },
+        fallback: null,
+        path: "greet",
+      });
     }
 
     // 1) Router
     const conversationHistory = (messages || []).slice(0, -1);
-    const { refined_query, intent, format } = await routeQuery(userQuery, conversationHistory);
+    const { refined_query: raw_refined_query, intent: raw_intent, format } = await routeQuery(userQuery, conversationHistory);
 
-    // 2) Retrieval
+    // Small intent override: if user explicitly asks "compare" / "difference" / "vs" prefer comparison table
+    const lowerQ = userQuery.toLowerCase();
+    let refined_query = raw_refined_query || userQuery;
+    let intent = raw_intent || "question";
+    if (/\b(compare|difference|vs\.?|vs\b|versus)\b/i.test(lowerQ)) {
+      intent = "comparison";
+    }
+
+    // 2) Retrieval (pgvector) — caller of retrieveCandidates handles pgvector failure
     const candidateRows = await retrieveCandidates(refined_query, { limit: 20 });
 
-    // If no candidates, fallback and return dual (RAG empty + fallback)
+    // If no candidates, fallback: return fallback-only (not dual)
     if (!candidateRows || candidateRows.length === 0) {
       const fallback = await getGeneralAnswer(userQuery);
-      const linkInfo = await verifyUrls(fallback.raw_urls || []);
+      const { cleanedText, urlsInText } = stripUrlsFromText(fallback.answer || "");
+      const linkInfo = await verifyUrls(fallback.raw_urls?.length ? fallback.raw_urls : urlsInText);
+      // return fallback-only (legacy-like shape will still be supported by frontend)
       return okJSON({
-        rag: { answer: null, sources: [] },
-        fallback: { answer: fallback.answer, links: linkInfo },
-        path: "dual",
+        answer: cleanedText,
+        sources: [],
+        fallback_links: linkInfo,
+        path: "fallback",
       });
     }
 
@@ -142,20 +165,24 @@ export default async function handler(req) {
     // 4) Rerank
     const reranked = await rerankCandidates(refined_query, candidates, Math.min(6, candidates.length));
 
-    // 5) Confidence check (pre-synthesis)
-    const confident = isConfident(reranked);
+    // 5) Confidence check (pre-synthesis) — apply a slightly more lenient rule in addition to isConfident
+    const confidentBefore = isConfident(reranked);
+    // lenient allowance: accept if top score >= 0.75 and meanTop3 >= 0.45
+    const topScore = (reranked[0]?.score) || 0;
+    const meanTop3 = (reranked.slice(0,3).reduce((s,d)=>s+(d.score||0),0)) / Math.min(3, reranked.length || 1);
+    const lenientAccept = topScore >= 0.75 && meanTop3 >= 0.45;
+    const confident = confidentBefore || lenientAccept;
 
-    // If not confident -> fallback (dual view), include attempted RAG sources
     if (!confident) {
       const fallback = await getGeneralAnswer(userQuery);
-      const linkInfo = await verifyUrls(fallback.raw_urls || []);
+      const { cleanedText, urlsInText } = stripUrlsFromText(fallback.answer || "");
+      const linkInfo = await verifyUrls(fallback.raw_urls?.length ? fallback.raw_urls : urlsInText);
       return okJSON({
-        rag: {
-          answer: null,
-          sources: reranked.map((d, idx) => ({ id: idx + 1, title: d.source_title, url: d.source_url, excerpt: d.content })),
-        },
-        fallback: { answer: fallback.answer, links: linkInfo },
-        path: "dual",
+        answer: cleanedText,
+        sources: [],
+        fallback_links: linkInfo,
+        path: "fallback",
+        reason: "pre_synthesis_low_confidence"
       });
     }
 
@@ -176,18 +203,20 @@ export default async function handler(req) {
     const numericEvidenceOk = numericEvidenceCheck(synthText, topDocs);
 
     if (hasMissing || !numericEvidenceOk) {
-      // fallback to ChatGPT and return both RAG and fallback (dual)
+      // fallback-only (don't show dual); remove URLs from fallback answer body
       const fallback = await getGeneralAnswer(userQuery);
-      const linkInfo = await verifyUrls(fallback.raw_urls || []);
+      const { cleanedText, urlsInText } = stripUrlsFromText(fallback.answer || "");
+      const linkInfo = await verifyUrls(fallback.raw_urls?.length ? fallback.raw_urls : urlsInText);
       return okJSON({
-        rag: { answer: final.answer, sources: final.sources || topDocs.map((d,i)=>({ id: i+1, title: d.source_title, url: d.source_url })) },
-        fallback: { answer: fallback.answer, links: linkInfo },
-        path: "dual",
+        answer: cleanedText,
+        sources: [],
+        fallback_links: linkInfo,
+        path: "fallback",
         reason: hasMissing ? "synthesis_incomplete" : "numeric_mismatch"
       });
     }
 
-    // 8) All good — return RAG-only
+    // 8) All good — return RAG-only in rag-shaped object
     return okJSON({
       rag: { answer: final.answer, sources: final.sources || topDocs.map((d,i)=>({ id: i+1, title: d.source_title, url: d.source_url })) },
       fallback: null,
