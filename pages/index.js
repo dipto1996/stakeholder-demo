@@ -1,53 +1,112 @@
 // pages/index.js
 import { useState, useRef, useEffect } from "react";
 
+/**
+ * Very small markdown-ish renderer with table support.
+ * - **bold**
+ * - "- " lists
+ * - simple tables starting with "|" (converts to HTML table)
+ * - line breaks -> <br/>
+ *
+ * NOTE: This is intentionally lightweight and safe.
+ */
 function simpleMarkdownToHtml(md = "") {
-  // Very small markdown-ish renderer:
-  // - **bold**
-  // - "- " lists
-  // - line breaks
-  let s = md || "";
-  s = s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  if (!md) return "";
+
+  // Escape HTML
+  let s = md.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  // Bold
   s = s.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+
+  // Detect a markdown table block: series of lines starting with '|' at least 2 rows
   const lines = s.split("\n");
-  let out = [];
-  let inList = false;
-  for (let i = 0; i < lines.length; i++) {
+  let i = 0;
+  const outParts = [];
+  while (i < lines.length) {
+    // Collect contiguous table lines
+    if (/^\s*\|/.test(lines[i])) {
+      const tblLines = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) {
+        tblLines.push(lines[i].trim());
+        i++;
+      }
+      const tableHtml = markdownTableToHtml(tblLines);
+      outParts.push(tableHtml);
+      continue;
+    }
+
+    // Non-table line handling: lists and normal text
     const line = lines[i];
     if (/^\s*-\s+/.test(line)) {
-      if (!inList) {
-        out.push("<ul style='margin-top:6px;margin-bottom:6px;'>");
-        inList = true;
+      // collect contiguous list lines
+      const listItems = [];
+      while (i < lines.length && /^\s*-\s+/.test(lines[i])) {
+        listItems.push(lines[i].replace(/^\s*-\s+/, "").trim());
+        i++;
       }
-      out.push("<li>" + line.replace(/^\s*-\s+/, "") + "</li>");
-    } else {
-      if (inList) {
-        out.push("</ul>");
-        inList = false;
-      }
-      out.push(line.replace(/\n/g, "<br/>"));
+      const lis = listItems.map(li => `<li>${li}</li>`).join("");
+      outParts.push(`<ul style='margin-top:6px;margin-bottom:6px;'>${lis}</ul>`);
+      continue;
     }
+
+    // plain text line: preserve single newlines as <br/>
+    outParts.push(line.replace(/\n/g, "<br/>"));
+    i++;
   }
-  if (inList) out.push("</ul>");
-  return out.join("\n");
+
+  return outParts.join("\n");
+}
+
+/**
+ * Convert array of markdown table lines (each starting and ending with |) into HTML table.
+ * Very forgiving:
+ * - First row -> header
+ * - Optional second row of separators (like |---|---|) is skipped
+ * - Remaining rows -> tbody
+ */
+function markdownTableToHtml(tblLines) {
+  if (!tblLines || tblLines.length === 0) return "";
+
+  // Parse rows to arrays of cells
+  const rows = tblLines.map(line => {
+    // remove leading and trailing pipe then split on pipes
+    const trimmed = line.replace(/^\s*\|/, "").replace(/\|\s*$/, "");
+    const cells = trimmed.split("|").map(c => c.trim());
+    return cells;
+  });
+
+  // If second row looks like separators (---), drop it
+  let header = rows[0] || [];
+  let bodyRows = rows.slice(1);
+  if (bodyRows.length > 0 && bodyRows[0].every(cell => /^:?-{2,}:?$/.test(cell))) {
+    bodyRows = bodyRows.slice(1);
+  }
+
+  // Build HTML
+  const thead = `<thead><tr>${header.map(h => `<th style="text-align:left;padding:8px;border-bottom:1px solid #eee">${h}</th>`).join("")}</tr></thead>`;
+  const tbody = `<tbody>${bodyRows
+    .map(r => `<tr>${r.map(c => `<td style="padding:8px;border-bottom:1px solid #f5f7fb">${c}</td>`).join("")}</tr>`)
+    .join("")}</tbody>`;
+
+  return `<div style="overflow:auto"><table style="width:100%;border-collapse:collapse;margin:8px 0 8px 0">${thead}${tbody}</table></div>`;
 }
 
 export default function ChatPage() {
-  const [messages, setMessages] = useState([]); // [{ role, content, path, sources?, fallbackLinks? }]
+  const [messages, setMessages] = useState([]); // { role, content, path, sources?, fallbackLinks? }
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [expandedSourcesFor, setExpandedSourcesFor] = useState(null);
   const endRef = useRef(null);
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  useEffect(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), [messages]);
 
   async function handleSubmit(e) {
     e?.preventDefault();
     const text = (input || "").trim();
     if (!text) return;
 
+    // Append user message
     const userMsg = { role: "user", content: text };
     setMessages((m) => [...m, userMsg]);
     setInput("");
@@ -61,75 +120,54 @@ export default function ChatPage() {
       });
 
       const data = await resp.json();
-      console.log("API /api/chat response:", data); // debug: remove later
+      console.log("API /api/chat response:", data); // debug, remove in prod
 
       if (!resp.ok) {
         throw new Error(data?.error || resp.statusText || "API error");
       }
 
-      // Normalize the possible response shapes:
-      // 1) { rag: {answer, sources}, path: "rag" }
-      // 2) { answer, sources: [], fallback_links, path: "fallback" }
-      // 3) { rag: {answer}, path: "greet" }
-      // 4) legacy: { answer, sources }
+      // Normalize backend shapes and ensure fallback links become 'sources' so UI shows them
       if (data.path === "rag" && data.rag) {
         setMessages((m) => [
           ...m,
-          {
-            role: "assistant",
-            content: data.rag.answer || "",
-            path: "rag",
-            sources: data.rag.sources || [],
-          },
+          { role: "assistant", content: data.rag.answer || "", path: "rag", sources: data.rag.sources || [] },
         ]);
       } else if (data.path === "greet" && data.rag) {
         setMessages((m) => [
           ...m,
-          {
-            role: "assistant",
-            content: data.rag.answer || "",
-            path: "greet",
-            sources: data.rag.sources || [],
-          },
+          { role: "assistant", content: data.rag.answer || "", path: "greet", sources: data.rag.sources || [] },
         ]);
       } else if (data.path === "fallback") {
-        // fallback-only shape: map backend fallback_links -> message.fallbackLinks
-        const fallbackLinks = data.fallback_links || data.fallbackLinks || [];
+        // Map fallback_links -> canonical sources array so UI shows them in Sources panel
+        const rawLinks = data.fallback_links || data.fallbackLinks || [];
+        const sources = Array.isArray(rawLinks)
+          ? rawLinks.map((l, idx) => {
+              // l might be string url or object {url, ok, status}
+              if (!l) return null;
+              if (typeof l === "string") return { id: idx + 1, title: l, url: l };
+              return { id: idx + 1, title: l.url || l.title || l, url: l.url || null, ok: l.ok, status: l.status };
+            }).filter(Boolean)
+          : [];
+
+        // fallback content should not show inline links (backend should have stripped them).
         setMessages((m) => [
           ...m,
-          {
-            role: "assistant",
-            content: data.answer || "",
-            path: "fallback",
-            fallbackLinks: Array.isArray(fallbackLinks) ? fallbackLinks : [],
-          },
+          { role: "assistant", content: data.answer || "", path: "fallback", sources },
         ]);
       } else if (data.answer && Array.isArray(data.sources)) {
-        // legacy shape
+        // Legacy shape: show sources if present, otherwise treat as fallback (no sources)
         const path = data.sources && data.sources.length > 0 ? "rag" : "fallback";
         setMessages((m) => [
           ...m,
-          {
-            role: "assistant",
-            content: data.answer || "",
-            path,
-            sources: data.sources || [],
-            fallbackLinks: data.fallback_links || [],
-          },
+          { role: "assistant", content: data.answer || "", path, sources: data.sources || [], fallbackLinks: data.fallback_links || [] },
         ]);
       } else {
-        // unknown shape - show raw response
-        setMessages((m) => [
-          ...m,
-          { role: "assistant", content: JSON.stringify(data), path: "fallback" },
-        ]);
+        // Unknown shape: show raw
+        setMessages((m) => [...m, { role: "assistant", content: JSON.stringify(data), path: "fallback" }]);
       }
     } catch (err) {
       console.error("chat error:", err);
-      setMessages((m) => [
-        ...m,
-        { role: "assistant", content: "Sorry — something went wrong.", path: "fallback" },
-      ]);
+      setMessages((m) => [...m, { role: "assistant", content: "Sorry — something went wrong.", path: "fallback" }]);
     } finally {
       setLoading(false);
     }
@@ -166,29 +204,15 @@ export default function ChatPage() {
                   )}
                 </div>
                 {s.excerpt && <div style={{ fontSize: 12, color: "#444", marginTop: 4 }}>{s.excerpt.slice(0, 300)}{s.excerpt.length > 300 ? "…" : ""}</div>}
+                {typeof s.ok !== "undefined" && (
+                  <div style={{ fontSize: 11, color: s.ok ? "#2b6" : "#b33", marginTop: 4 }}>
+                    {s.ok ? "Verified (link reachable)" : "Link check failed"} {s.status ? `(${s.status})` : ""}
+                  </div>
+                )}
               </div>
             ))}
           </div>
         )}
-      </div>
-    );
-  }
-
-  function renderFallbackLinks(links = []) {
-    if (!links || links.length === 0) return null;
-    return (
-      <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed #eee", background: "#fff8f0" }}>
-        <div style={{ fontSize: 12, color: "#8a4b00", fontWeight: 700 }}>Links</div>
-        <div style={{ marginTop: 8 }}>
-          {links.map((l) => (
-            <div key={l.url} style={{ fontSize: 13, marginBottom: 6 }}>
-              <a href={l.url} target="_blank" rel="noopener noreferrer" style={{ color: "#b56b00", textDecoration: "underline" }}>
-                {l.url}
-              </a>{" "}
-              <span style={{ fontSize: 12, color: l.ok ? "#2b6" : "#b33" }}>({l.status || (l.ok ? "OK" : "failed")})</span>
-            </div>
-          ))}
-        </div>
       </div>
     );
   }
@@ -206,18 +230,21 @@ export default function ChatPage() {
           boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
           border: isUser ? "none" : "1px solid #eee",
         }}>
+          {/* fallback disclaimer */}
           {!isUser && m.path === "fallback" && (
             <div style={{ fontSize: 12, color: "#8a4b00", marginBottom: 8 }}>
               <strong>Note:</strong> This answer is based on general knowledge and not verified sources.
             </div>
           )}
 
+          {/* message content (safe HTML) */}
           <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.45 }} dangerouslySetInnerHTML={{ __html: simpleMarkdownToHtml(m.content || "") }} />
 
-          {!isUser && m.path === "rag" && m.sources && m.sources.length > 0 && (
+          {/* Sources panel for both RAG and fallback (we now always store links in m.sources) */}
+          {!isUser && m.sources && m.sources.length > 0 && (
             <div style={{ marginTop: 8 }}>
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                <div style={{ fontSize: 12, color: "#215", fontWeight: 700 }}>Verified (RAG)</div>
+                <div style={{ fontSize: 12, color: "#215", fontWeight: 700 }}>{m.path === "rag" ? "Verified (RAG)" : "Sources"}</div>
                 <button onClick={() => toggleSources(idx)} style={{ fontSize: 12, color: "#1558d6", background: "transparent", border: "none", cursor: "pointer" }}>
                   {expandedSourcesFor === idx ? "Hide sources" : "Show sources"}
                 </button>
@@ -226,14 +253,6 @@ export default function ChatPage() {
             </div>
           )}
 
-          {!isUser && m.path === "fallback" && m.fallbackLinks && m.fallbackLinks.length > 0 && (
-            <div style={{ marginTop: 8 }}>
-              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                <div style={{ fontSize: 12, color: "#8a4b00", fontWeight: 700 }}>Links</div>
-              </div>
-              {renderFallbackLinks(m.fallbackLinks)}
-            </div>
-          )}
         </div>
       </div>
     );
