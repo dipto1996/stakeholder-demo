@@ -1,4 +1,4 @@
-// pages/api/chat.js (updated orchestrator)
+// pages/api/chat.js
 import { sql } from "@vercel/postgres";
 import openai from "../../lib/openaiClient.js";
 import { routeQuery } from "../../lib/rag/router.js";
@@ -54,7 +54,6 @@ function stripUrlsFromText(text = "") {
   return { cleanedText: cleaned, urlsInText: urls };
 }
 
-// numeric evidence check (unchanged)
 function numericEvidenceCheck(answerText = "", docs = []) {
   if (!answerText) return false;
   const currencyMatches = Array.from(new Set([...answerText.matchAll(/\$\s?[\d,]+(?:\.\d+)?/g)].map(m => m[0].replace(/\s+/g, ""))));
@@ -73,17 +72,12 @@ function numericEvidenceCheck(answerText = "", docs = []) {
   return false;
 }
 
-/**
- * visaTermEvidenceCheck(answerText, docs)
- * If answer asserts that specific visa classes (e.g., L1, J1) are affected,
- * ensure those visa labels appear in the docs. If not present, return false.
- */
 function visaTermEvidenceCheck(answerText = "", docs = []) {
   if (!answerText) return true;
   const visaTerms = ["h-1b","h1b","h-1b visa","l1","l-1","l-1 visa","j1","j-1","j-1 visa","o-1","o1"];
   const lowAns = answerText.toLowerCase();
   const mentioned = visaTerms.filter(t => lowAns.includes(t));
-  if (mentioned.length === 0) return true; // no visa class assertions => ok
+  if (mentioned.length === 0) return true;
   const lowerDocs = docs.map(d => (d.content || "").toLowerCase());
   for (const term of mentioned) {
     let found = false;
@@ -91,12 +85,11 @@ function visaTermEvidenceCheck(answerText = "", docs = []) {
       if (!dtext) continue;
       if (dtext.includes(term)) { found = true; break; }
     }
-    if (!found) return false; // claimed visa term not present in docs
+    if (!found) return false;
   }
   return true;
 }
 
-// short greeting detector (strict)
 function isShortGreeting(text = "") {
   if (!text) return false;
   const trimmed = text.trim();
@@ -116,7 +109,7 @@ export default async function handler(req) {
     const userQuery = (messages[messages.length - 1].content || "").trim();
     if (!userQuery) return badRequest("Empty user query");
 
-    // greeting path - strict
+    // greeting
     if (isShortGreeting(userQuery)) {
       const greetResp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
@@ -131,27 +124,28 @@ export default async function handler(req) {
       return okJSON({ rag: { answer: greet, sources: [] }, fallback: null, path: "greet" });
     }
 
-    // Router / intent
+    // Router
     const conversationHistory = (messages || []).slice(0, -1);
     const { refined_query: raw_refined_query, intent: raw_intent } = await routeQuery(userQuery, conversationHistory);
-
     let refined_query = raw_refined_query || userQuery;
     let intent = raw_intent || "question";
     const lowerQ = userQuery.toLowerCase();
     if (/\b(compare|difference|vs\.?|vs\b|versus)\b/i.test(lowerQ)) intent = "comparison";
 
-    // Retrieval
+    // Retrieval (pgvector or keyword fallback)
     const candidateRows = await retrieveCandidates(refined_query, { limit: 20 });
+
     if (!candidateRows || candidateRows.length === 0) {
       const fallback = await getGeneralAnswer(userQuery, conversationHistory);
       const { cleanedText, urlsInText } = stripUrlsFromText(fallback.answer || "");
       const disclaimer = "Disclaimer: Based on general knowledge (not verified sources). Please consult official sources for legal decisions.\n\n";
       const cleanedWithDisclaimer = cleanedText.toLowerCase().startsWith("disclaimer:") ? cleanedText : disclaimer + cleanedText;
-      const linkInfo = await verifyUrls(fallback.raw_urls?.length ? fallback.raw_urls : urlsInText);
+      const rawUrls = (fallback.raw_urls && fallback.raw_urls.length) ? fallback.raw_urls : urlsInText;
+      const linkInfo = await verifyUrls(rawUrls);
       return okJSON({ answer: cleanedWithDisclaimer, sources: [], fallback_links: linkInfo, path: "fallback" });
     }
 
-    // prepare candidates
+    // prepare candidates and rerank
     const candidates = candidateRows.map((r, i) => ({
       id: r.id || i + 1,
       content: (r.content || "").slice(0, 1600),
@@ -160,10 +154,9 @@ export default async function handler(req) {
       source_file: r.source_file,
     }));
 
-    // rerank (domain-aware inside reranker)
     const reranked = await rerankCandidates(refined_query, candidates, Math.min(6, candidates.length));
 
-    // confidence check (conservative + small leniency)
+    // confidence check using balanced thresholds
     const confidentBefore = isConfident(reranked);
     const topScore = (reranked[0]?.score) || 0;
     const meanTop3 = (reranked.slice(0,3).reduce((s,d)=>s+(d.score||0),0)) / Math.min(3, reranked.length || 1);
@@ -175,11 +168,12 @@ export default async function handler(req) {
       const { cleanedText, urlsInText } = stripUrlsFromText(fallback.answer || "");
       const disclaimer = "Disclaimer: Based on general knowledge (not verified sources). Please consult official sources for legal decisions.\n\n";
       const cleanedWithDisclaimer = cleanedText.toLowerCase().startsWith("disclaimer:") ? cleanedText : disclaimer + cleanedText;
-      const linkInfo = await verifyUrls(fallback.raw_urls?.length ? fallback.raw_urls : urlsInText);
+      const rawUrls = (fallback.raw_urls && fallback.raw_urls.length) ? fallback.raw_urls : urlsInText;
+      const linkInfo = await verifyUrls(rawUrls);
       return okJSON({ answer: cleanedWithDisclaimer, sources: [], fallback_links: linkInfo, path: "fallback", reason: "pre_synthesis_low_confidence" });
     }
 
-    // synthesize from top docs
+    // Synthesize
     const topDocs = reranked.map((d) => ({
       id: d.id,
       content: d.content,
@@ -189,7 +183,7 @@ export default async function handler(req) {
     }));
     const final = await synthesizeRAGAnswer(topDocs, userQuery, intent, conversationHistory);
 
-    // post-checks: missing markers, numeric evidence, visa-term evidence
+    // post checks
     const synthText = final.answer || "";
     const hasMissing = synthesisHasMissingMarkers(synthText);
     const numericOk = numericEvidenceCheck(synthText, topDocs);
@@ -200,14 +194,15 @@ export default async function handler(req) {
       const { cleanedText, urlsInText } = stripUrlsFromText(fallback.answer || "");
       const disclaimer = "Disclaimer: Based on general knowledge (not verified sources). Please consult official sources for legal decisions.\n\n";
       const cleanedWithDisclaimer = cleanedText.toLowerCase().startsWith("disclaimer:") ? cleanedText : disclaimer + cleanedText;
-      const linkInfo = await verifyUrls(fallback.raw_urls?.length ? fallback.raw_urls : urlsInText);
+      const rawUrls = (fallback.raw_urls && fallback.raw_urls.length) ? fallback.raw_urls : urlsInText;
+      const linkInfo = await verifyUrls(rawUrls);
       const reason = hasMissing ? "synthesis_incomplete" : (!numericOk ? "numeric_mismatch" : "visa_term_mismatch");
       return okJSON({ answer: cleanedWithDisclaimer, sources: [], fallback_links: linkInfo, path: "fallback", reason });
     }
 
-    // success - return rag object
+    // success: return rag object (sources include urls)
     return okJSON({
-      rag: { answer: final.answer, sources: final.sources || topDocs.map((d,i) => ({ id: i+1, title: d.source_title, url: d.source_url })) },
+      rag: { answer: final.answer, sources: final.sources || topDocs.map((d,i)=>({ id: i+1, title: d.source_title, url: d.source_url })) },
       fallback: null,
       path: "rag",
     });
