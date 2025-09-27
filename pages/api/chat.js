@@ -54,10 +54,19 @@ async function verifyUrls(urls = []) {
 }
 
 /**
+ * Remove URLs and a trailing "URLs:" block from a text. Returns { cleanedText, urlsInText }.
+ */
+function stripUrlsFromText(text = "") {
+  const urlRegex = /\bhttps?:\/\/[^\s)]+/gi;
+  const urls = Array.from(new Set((text.match(urlRegex) || []).map(u => u.replace(/[),.]*$/, ""))));
+  let cleaned = text.replace(urlRegex, "").replace(/URLs?:\s*\n?([\s\S]*)$/i, "").trim();
+  cleaned = cleaned.replace(/\n{2,}/g, "\n\n").trim();
+  return { cleanedText: cleaned, urlsInText: urls };
+}
+
+/**
  * numericEvidenceCheck(answerText, docs)
- * Look for numeric/currency tokens in the answer and ensure at least one token appears in the retrieved docs.
- * If numeric claims present but not found in docs => return false (no evidence).
- * Otherwise return true.
+ * Same as before — keeps protection vs fabricated numeric claims.
  */
 function numericEvidenceCheck(answerText = "", docs = []) {
   if (!answerText) return false;
@@ -65,7 +74,7 @@ function numericEvidenceCheck(answerText = "", docs = []) {
   const plainNumberMatches = Array.from(new Set([...answerText.matchAll(/\b\d{4}\b|\b\d{3,}\b/g)].map(m => m[0])));
 
   const numericCandidates = [...currencyMatches, ...plainNumberMatches].map(s => s.replace(/[,]/g, "").toLowerCase());
-  if (numericCandidates.length === 0) return true; // no numeric claims => OK
+  if (numericCandidates.length === 0) return true;
 
   const lowerDocs = docs.map(d => (d.content || "").replace(/[,]/g, "").toLowerCase());
   for (const token of numericCandidates) {
@@ -79,18 +88,14 @@ function numericEvidenceCheck(answerText = "", docs = []) {
   return false;
 }
 
-/**
- * Remove URLs and a trailing "URLs:" block from a text. Returns { cleanedText, urlsInText }.
- * We use this to keep fallback answer body clean and move links into fallback_links.
- */
-function stripUrlsFromText(text = "") {
-  const urlRegex = /\bhttps?:\/\/[^\s)]+/gi;
-  const urls = Array.from(new Set((text.match(urlRegex) || []).map(u => u.replace(/[),.]*$/, ""))));
-  // remove URLs and any leading "URLs:" section lines
-  let cleaned = text.replace(urlRegex, "").replace(/URLs?:\s*\n?([\s\S]*)$/i, "").trim();
-  // remove multiple blank lines
-  cleaned = cleaned.replace(/\n{2,}/g, "\n\n").trim();
-  return { cleanedText: cleaned, urlsInText: urls };
+// Determine if a message is a short standalone greeting (e.g. "hi", "hello", "hey there")
+function isShortGreeting(text = "") {
+  if (!text) return false;
+  const trimmed = text.trim();
+  const wordCount = trimmed.split(/\s+/).filter(Boolean).length;
+  // only treat as greeting when short (<= 4 words) and matches greeting pattern
+  if (wordCount > 4) return false;
+  return /^(hi|hello|hey|hey there|good (morning|afternoon|evening)|howdy)[\s!.,]*$/i.test(trimmed);
 }
 
 export default async function handler(req) {
@@ -104,19 +109,18 @@ export default async function handler(req) {
     const userQuery = (messages[messages.length - 1].content || "").trim();
     if (!userQuery) return badRequest("Empty user query");
 
-    // quick greeting path — return as a 'greet' path so frontend won't label it fallback
-    if (/^(hi|hello|hey|good (morning|afternoon|evening))\b/i.test(userQuery)) {
+    // 1) Greeting path: only trigger for short, standalone greetings
+    if (isShortGreeting(userQuery)) {
       const greetResp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           { role: "system", content: "You are a warm, succinct immigration info assistant. Greet briefly and ask how you can help." },
           { role: "user", content: userQuery },
         ],
-        max_tokens: 80,
+        max_tokens: 120,
         temperature: 0.2,
       });
       const greet = greetResp?.choices?.[0]?.message?.content?.trim() || "Hello! How can I help?";
-      // return in rag-shaped object with a 'greet' path so UI doesn't show fallback disclaimer
       return okJSON({
         rag: { answer: greet, sources: [] },
         fallback: null,
@@ -124,36 +128,37 @@ export default async function handler(req) {
       });
     }
 
-    // 1) Router
+    // 2) Router
     const conversationHistory = (messages || []).slice(0, -1);
     const { refined_query: raw_refined_query, intent: raw_intent, format } = await routeQuery(userQuery, conversationHistory);
 
-    // Small intent override: if user explicitly asks "compare" / "difference" / "vs" prefer comparison table
-    const lowerQ = userQuery.toLowerCase();
     let refined_query = raw_refined_query || userQuery;
     let intent = raw_intent || "question";
+    const lowerQ = userQuery.toLowerCase();
     if (/\b(compare|difference|vs\.?|vs\b|versus)\b/i.test(lowerQ)) {
       intent = "comparison";
     }
 
-    // 2) Retrieval (pgvector) — caller of retrieveCandidates handles pgvector failure
+    // 3) Retrieval
     const candidateRows = await retrieveCandidates(refined_query, { limit: 20 });
 
-    // If no candidates, fallback: return fallback-only (not dual)
+    // If no candidates -> fallback-only
     if (!candidateRows || candidateRows.length === 0) {
       const fallback = await getGeneralAnswer(userQuery);
       const { cleanedText, urlsInText } = stripUrlsFromText(fallback.answer || "");
+      // ensure disclaimer present at top of fallback cleanedText
+      const disclaimer = "Disclaimer: Based on general knowledge (not verified sources). Please consult official sources for legal decisions.\n\n";
+      const cleanedWithDisclaimer = cleanedText.toLowerCase().startsWith("disclaimer:") ? cleanedText : disclaimer + cleanedText;
       const linkInfo = await verifyUrls(fallback.raw_urls?.length ? fallback.raw_urls : urlsInText);
-      // return fallback-only (legacy-like shape will still be supported by frontend)
       return okJSON({
-        answer: cleanedText,
+        answer: cleanedWithDisclaimer,
         sources: [],
         fallback_links: linkInfo,
         path: "fallback",
       });
     }
 
-    // 3) Prepare candidates for reranking
+    // 4) prepare candidates and rerank
     const candidates = candidateRows.map((r, i) => ({
       id: r.id || i + 1,
       content: (r.content || "").slice(0, 1600),
@@ -162,12 +167,10 @@ export default async function handler(req) {
       source_file: r.source_file,
     }));
 
-    // 4) Rerank
     const reranked = await rerankCandidates(refined_query, candidates, Math.min(6, candidates.length));
 
-    // 5) Confidence check (pre-synthesis) — apply a slightly more lenient rule in addition to isConfident
+    // 5) Confidence check (allow slight leniency)
     const confidentBefore = isConfident(reranked);
-    // lenient allowance: accept if top score >= 0.75 and meanTop3 >= 0.45
     const topScore = (reranked[0]?.score) || 0;
     const meanTop3 = (reranked.slice(0,3).reduce((s,d)=>s+(d.score||0),0)) / Math.min(3, reranked.length || 1);
     const lenientAccept = topScore >= 0.75 && meanTop3 >= 0.45;
@@ -176,9 +179,11 @@ export default async function handler(req) {
     if (!confident) {
       const fallback = await getGeneralAnswer(userQuery);
       const { cleanedText, urlsInText } = stripUrlsFromText(fallback.answer || "");
+      const disclaimer = "Disclaimer: Based on general knowledge (not verified sources). Please consult official sources for legal decisions.\n\n";
+      const cleanedWithDisclaimer = cleanedText.toLowerCase().startsWith("disclaimer:") ? cleanedText : disclaimer + cleanedText;
       const linkInfo = await verifyUrls(fallback.raw_urls?.length ? fallback.raw_urls : urlsInText);
       return okJSON({
-        answer: cleanedText,
+        answer: cleanedWithDisclaimer,
         sources: [],
         fallback_links: linkInfo,
         path: "fallback",
@@ -186,7 +191,7 @@ export default async function handler(req) {
       });
     }
 
-    // 6) Synthesize using top reranked docs
+    // 6) Synthesize from top reranked docs
     const topDocs = reranked.map((d) => ({
       id: d.id,
       content: d.content,
@@ -203,12 +208,13 @@ export default async function handler(req) {
     const numericEvidenceOk = numericEvidenceCheck(synthText, topDocs);
 
     if (hasMissing || !numericEvidenceOk) {
-      // fallback-only (don't show dual); remove URLs from fallback answer body
       const fallback = await getGeneralAnswer(userQuery);
       const { cleanedText, urlsInText } = stripUrlsFromText(fallback.answer || "");
+      const disclaimer = "Disclaimer: Based on general knowledge (not verified sources). Please consult official sources for legal decisions.\n\n";
+      const cleanedWithDisclaimer = cleanedText.toLowerCase().startsWith("disclaimer:") ? cleanedText : disclaimer + cleanedText;
       const linkInfo = await verifyUrls(fallback.raw_urls?.length ? fallback.raw_urls : urlsInText);
       return okJSON({
-        answer: cleanedText,
+        answer: cleanedWithDisclaimer,
         sources: [],
         fallback_links: linkInfo,
         path: "fallback",
@@ -216,7 +222,7 @@ export default async function handler(req) {
       });
     }
 
-    // 8) All good — return RAG-only in rag-shaped object
+    // 8) Good RAG answer — return rag object
     return okJSON({
       rag: { answer: final.answer, sources: final.sources || topDocs.map((d,i)=>({ id: i+1, title: d.source_title, url: d.source_url })) },
       fallback: null,
