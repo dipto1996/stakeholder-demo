@@ -1,5 +1,6 @@
 // pages/index.js
 import { useState, useRef, useEffect } from "react";
+import Sidebar from "../components/Sidebar";
 
 /* ---------------------------
    Small markdown-ish renderer
@@ -89,6 +90,7 @@ export default function ChatPage() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [expandedSourcesFor, setExpandedSourcesFor] = useState(null);
+  const [sidebarConversation, setSidebarConversation] = useState(null); // new: holds selected conv meta
   const endRef = useRef(null);
 
   useEffect(() => {
@@ -258,40 +260,80 @@ export default function ChatPage() {
     );
   }
 
+  // New: load a conversation when selected in sidebar
+  async function onSelectConversation(conv) {
+    if (!conv) return;
+    // If conv already has messages, use them
+    if (conv.messages && Array.isArray(conv.messages)) {
+      setMessages(conv.messages);
+      return;
+    }
+    // Otherwise try to fetch the conversation by id
+    try {
+      const id = conv.id;
+      if (!id) {
+        alert("Selected conversation has no id");
+        return;
+      }
+      const r = await fetch(`/api/conversations/get?id=${encodeURIComponent(id)}`);
+      if (!r.ok) {
+        console.warn("Could not fetch conversation, status:", r.status);
+        alert("Could not load saved conversation (server returned " + r.status + ").");
+        return;
+      }
+      const d = await r.json();
+      const msgs = d.conversation?.messages || d.messages || d;
+      if (Array.isArray(msgs)) {
+        setMessages(msgs);
+      } else {
+        alert("Saved conversation did not contain messages.");
+      }
+    } catch (err) {
+      console.error("Load conversation error:", err);
+      alert("Could not load conversation. See console for details.");
+    }
+  }
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100vh", fontFamily: "Inter, system-ui, sans-serif" }}>
-      <header style={{ position: "relative", padding: 16, borderBottom: "1px solid #eee", background: "#fff" }}>
-        <h2 style={{ margin: 0 }}>Immigration AI Assistant</h2>
-        <div style={{ color: "#666", fontSize: 13 }}>Informational Tool — Not Legal Advice</div>
+    <div style={{ display: "flex", height: "100vh", fontFamily: "Inter, system-ui, sans-serif" }}>
+      {/* Sidebar on the left (new) */}
+      <Sidebar onSelectConversation={onSelectConversation} />
 
-        <div style={{ position: "absolute", right: 16, top: 12 }}>
-          <a href="/login" style={{ padding: "8px 12px", background: "#0b63d8", color: "#fff", borderRadius: 8, textDecoration: "none" }}>
-            Sign in / Sign up
-          </a>
-        </div>
-      </header>
+      {/* Main chat area (existing UI preserved) */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
+        <header style={{ position: "relative", padding: 16, borderBottom: "1px solid #eee", background: "#fff" }}>
+          <h2 style={{ margin: 0 }}>Immigration AI Assistant</h2>
+          <div style={{ color: "#666", fontSize: 13 }}>Informational Tool — Not Legal Advice</div>
 
-      <main style={{ flex: 1, overflow: "auto", padding: 20 }}>
-        <div style={{ maxWidth: 900, margin: "0 auto" }}>
-          {messages.map((m, idx) => renderMessage(m, idx))}
-          <div ref={endRef} />
-        </div>
-      </main>
+          <div style={{ position: "absolute", right: 16, top: 12 }}>
+            <a href="/login" style={{ padding: "8px 12px", background: "#0b63d8", color: "#fff", borderRadius: 8, textDecoration: "none" }}>
+              Sign in / Sign up
+            </a>
+          </div>
+        </header>
 
-      <footer style={{ padding: 16, borderTop: "1px solid #eee", background: "#fff" }}>
-        <form onSubmit={handleSubmit} style={{ maxWidth: 900, margin: "0 auto", display: "flex", gap: 8 }}>
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask a question about U.S. immigration..."
-            style={{ flex: 1, padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd" }}
-            disabled={loading}
-          />
-          <button type="submit" disabled={loading} style={{ padding: "10px 14px", borderRadius: 8, background: "#0b63d8", color: "#fff", border: "none" }}>
-            {loading ? "Thinking..." : "Send"}
-          </button>
-        </form>
-      </footer>
+        <main style={{ flex: 1, overflow: "auto", padding: 20 }}>
+          <div style={{ maxWidth: 900, margin: "0 auto" }}>
+            {messages.map((m, idx) => renderMessage(m, idx))}
+            <div ref={endRef} />
+          </div>
+        </main>
+
+        <footer style={{ padding: 16, borderTop: "1px solid #eee", background: "#fff" }}>
+          <form onSubmit={handleSubmit} style={{ maxWidth: 900, margin: "0 auto", display: "flex", gap: 8 }}>
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="Ask a question about U.S. immigration..."
+              style={{ flex: 1, padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd" }}
+              disabled={loading}
+            />
+            <button type="submit" disabled={loading} style={{ padding: "10px 14px", borderRadius: 8, background: "#0b63d8", color: "#fff", border: "none" }}>
+              {loading ? "Thinking..." : "Send"}
+            </button>
+          </form>
+        </footer>
+      </div>
     </div>
   );
 }
