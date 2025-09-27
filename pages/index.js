@@ -1,14 +1,53 @@
 // pages/index.js
 import { useState, useRef, useEffect } from "react";
 
+function simpleMarkdownToHtml(md = "") {
+  // VERY small and safe markdown-ish transformer:
+  // - **bold**
+  // - lines starting with "- " -> list items
+  // - simple newlines to <br/>
+  let s = md
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+  // bold **text**
+  s = s.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+
+  // convert lines starting with "- " into <li> items, grouped into <ul>
+  const lines = s.split("\n");
+  let out = [];
+  let inList = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*-\s+/.test(line)) {
+      if (!inList) {
+        out.push("<ul style='margin-top:6px;margin-bottom:6px;'>");
+        inList = true;
+      }
+      out.push("<li>" + line.replace(/^\s*-\s+/, "") + "</li>");
+    } else {
+      if (inList) {
+        out.push("</ul>");
+        inList = false;
+      }
+      out.push(line.replace(/\n/g, "<br/>"));
+    }
+  }
+  if (inList) out.push("</ul>");
+  return out.join("\n");
+}
+
 export default function ChatPage() {
-  const [messages, setMessages] = useState([]); // { role: 'user'|'assistant', content, sources?:[], path?:'rag'|'fallback' }
+  const [messages, setMessages] = useState([]); // { role, content, path, sources?, fallbackLinks? }
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [showSourcesFor, setShowSourcesFor] = useState(null); // message index to expand sources
+  const [expandedSourcesFor, setExpandedSourcesFor] = useState(null);
   const endRef = useRef(null);
 
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   async function handleSubmit(e) {
     e?.preventDefault();
@@ -28,40 +67,90 @@ export default function ChatPage() {
       const data = await resp.json();
       if (!resp.ok) throw new Error(data?.error || resp.statusText);
 
-      // detect if fallback (no sources)
-      const pathIsFallback = !Array.isArray(data.sources) || data.sources.length === 0;
-      const assistantMsg = {
-        role: "assistant",
-        content: data.answer || "No answer",
-        sources: data.sources || [],
-        path: pathIsFallback ? "fallback" : "rag",
-      };
-      setMessages((m) => [...m, assistantMsg]);
+      // Handle both older simple shape and new dual shape
+      if (data.path === "rag" && data.rag) {
+        // new shape rag-only
+        setMessages((m) => [
+          ...m,
+          {
+            role: "assistant",
+            content: data.rag.answer || "",
+            path: "rag",
+            sources: data.rag.sources || [],
+          },
+        ]);
+      } else if (data.path === "dual") {
+        // we show rag first (if present) then fallback
+        if (data.rag && data.rag.answer) {
+          setMessages((m) => [
+            ...m,
+            {
+              role: "assistant",
+              content: data.rag.answer,
+              path: "rag",
+              sources: data.rag.sources || [],
+            },
+          ]);
+        } else if (data.rag && data.rag.sources && data.rag.sources.length > 0) {
+          // show a short note that we attempted rag but couldn't synthesize
+          setMessages((m) => [
+            ...m,
+            {
+              role: "assistant",
+              content:
+                "I attempted to find verified sources but couldn't fully synthesize a complete answer from them.",
+              path: "rag",
+              sources: data.rag.sources || [],
+            },
+          ]);
+        }
+
+        if (data.fallback) {
+          setMessages((m) => [
+            ...m,
+            {
+              role: "assistant",
+              content: data.fallback.answer || "",
+              path: "fallback",
+              fallbackLinks: data.fallback.links || [],
+            },
+          ]);
+        }
+      } else if (data.answer && data.sources) {
+        // legacy shape: {answer, sources}
+        setMessages((m) => [
+          ...m,
+          { role: "assistant", content: data.answer, path: data.sources && data.sources.length > 0 ? "rag" : "fallback", sources: data.sources || [] },
+        ]);
+      } else {
+        // unknown shape, just show raw
+        setMessages((m) => [...m, { role: "assistant", content: JSON.stringify(data), path: "fallback" }]);
+      }
     } catch (err) {
       console.error("chat error:", err);
-      setMessages((m) => [...m, { role: "assistant", content: "Sorry — something went wrong." }]);
+      setMessages((m) => [...m, { role: "assistant", content: "Sorry — something went wrong.", path: "fallback" }]);
     } finally {
       setLoading(false);
     }
   }
 
   function toggleSources(idx) {
-    setShowSourcesFor((s) => (s === idx ? null : idx));
+    setExpandedSourcesFor((s) => (s === idx ? null : idx));
   }
 
-  function renderSources(sources = [], idx) {
+  function renderSources(sources = [], msgIdx) {
     if (!sources || sources.length === 0) return null;
-    const collapsed = showSourcesFor !== idx;
+    const expanded = expandedSourcesFor === msgIdx;
     return (
       <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid #eee", background: "#f7fbff" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <div style={{ fontSize: 12, color: "#2a4365", fontWeight: 700 }}>Sources</div>
-          <button onClick={() => toggleSources(idx)} style={{ fontSize: 12, color: "#1558d6", background: "transparent", border: "none", cursor: "pointer" }}>
-            {collapsed ? "Show" : "Hide"}
+          <button onClick={() => toggleSources(msgIdx)} style={{ fontSize: 12, color: "#1558d6", background: "transparent", border: "none", cursor: "pointer" }}>
+            {expanded ? "Hide" : "Show"}
           </button>
         </div>
 
-        {!collapsed && (
+        {expanded && (
           <div style={{ marginTop: 8 }}>
             {sources.map((s) => (
               <div key={s.id} style={{ fontSize: 13, marginBottom: 8 }}>
@@ -84,6 +173,25 @@ export default function ChatPage() {
     );
   }
 
+  function renderFallbackLinks(links = []) {
+    if (!links || links.length === 0) return null;
+    return (
+      <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed #eee", background: "#fff8f0" }}>
+        <div style={{ fontSize: 12, color: "#8a4b00", fontWeight: 700 }}>Links (from fallback)</div>
+        <div style={{ marginTop: 8 }}>
+          {links.map((l) => (
+            <div key={l.url} style={{ fontSize: 13, marginBottom: 6 }}>
+              <a href={l.url} target="_blank" rel="noopener noreferrer" style={{ color: "#b56b00", textDecoration: "underline" }}>
+                {l.url}
+              </a>{" "}
+              <span style={{ fontSize: 12, color: l.ok ? "#2b6" : "#b33" }}>({l.status || (l.ok ? "OK" : "failed")})</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   function renderMessage(m, idx) {
     const isUser = m.role === "user";
     return (
@@ -98,35 +206,31 @@ export default function ChatPage() {
           border: isUser ? "none" : "1px solid #eee",
         }}>
           {!isUser && m.path === "fallback" && (
-            <div style={{ fontSize: 12, color: "#744", marginBottom: 8 }}>
-              <strong>Note:</strong> This answer is based on general knowledge, not verified sources.
+            <div style={{ fontSize: 12, color: "#8a4b00", marginBottom: 8 }}>
+              <strong>Note:</strong> This answer is based on general knowledge and not verified sources.
             </div>
           )}
 
-          <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.45 }}>{m.content}</div>
+          <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.45 }} dangerouslySetInnerHTML={{ __html: simpleMarkdownToHtml(m.content || "") }} />
 
-          {!isUser && m.sources && m.sources.length > 0 && (
+          {!isUser && m.path === "rag" && m.sources && m.sources.length > 0 && (
             <div style={{ marginTop: 8 }}>
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                <div style={{ fontSize: 12, color: "#315", fontWeight: 600 }}>
-                  {m.path === "rag" ? "Verified (RAG)" : "General"}
-                </div>
-                <button
-                  onClick={() => {
-                    navigator.clipboard?.writeText(m.content);
-                  }}
-                  style={{ fontSize: 12, color: "#1558d6", background: "transparent", border: "none", cursor: "pointer" }}
-                >
-                  Copy
-                </button>
-                <button
-                  onClick={() => toggleSources(idx)}
-                  style={{ fontSize: 12, color: "#1558d6", background: "transparent", border: "none", cursor: "pointer" }}
-                >
-                  {showSourcesFor === idx ? "Hide sources" : "Show sources"}
+                <div style={{ fontSize: 12, color: "#215", fontWeight: 700 }}>Verified (RAG)</div>
+                <button onClick={() => toggleSources(idx)} style={{ fontSize: 12, color: "#1558d6", background: "transparent", border: "none", cursor: "pointer" }}>
+                  {expandedSourcesFor === idx ? "Hide sources" : "Show sources"}
                 </button>
               </div>
               {renderSources(m.sources, idx)}
+            </div>
+          )}
+
+          {!isUser && m.path === "fallback" && m.fallbackLinks && (
+            <div style={{ marginTop: 8 }}>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <div style={{ fontSize: 12, color: "#8a4b00", fontWeight: 700 }}>Fallback (unverified)</div>
+              </div>
+              {renderFallbackLinks(m.fallbackLinks)}
             </div>
           )}
         </div>
