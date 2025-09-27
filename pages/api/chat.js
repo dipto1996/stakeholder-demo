@@ -17,7 +17,15 @@ function badRequest(msg) {
   return new Response(JSON.stringify({ error: msg }), { status: 400, headers: { "Content-Type": "application/json" } });
 }
 
-// small URL verification similar to earlier (parallel, per-url timeout)
+function stripInlineLinks(text = "") {
+  // Remove any explicit "Links:" block and any bare URLs; return cleaned text and urls
+  const urlRegex = /\bhttps?:\/\/[^\s)]+/gi;
+  const urls = Array.from(new Set((text.match(urlRegex) || []).map(u => u.replace(/[),.]*$/, ""))));
+  let cleaned = text.replace(urlRegex, "").replace(/(Links|URLs?)\s*:\s*\n?[\s\S]*$/i, "").trim();
+  cleaned = cleaned.replace(/\n{2,}/g, "\n\n").trim();
+  return { cleanedText: cleaned, urlsInText: urls };
+}
+
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 2000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -30,6 +38,7 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 2000) {
     throw e;
   }
 }
+
 async function verifyUrls(urls = [], { maxUrls = 6, perUrlTimeout = 2000 } = {}) {
   if (!Array.isArray(urls) || urls.length === 0) return [];
   const take = urls.slice(0, maxUrls);
@@ -54,13 +63,12 @@ async function verifyUrls(urls = [], { maxUrls = 6, perUrlTimeout = 2000 } = {})
   return settled.map(s => s.status === "fulfilled" ? s.value : null).filter(Boolean);
 }
 
-// detect synthesizer missing markers
 function synthesisHasMissingMarkers(text) {
   if (!text) return true;
   const low = text.toLowerCase();
   const markers = [
-    "not in sources", "not in the sources", "not present in the sources", "i could not find",
-    "no supporting source", "no evidence in the sources", "not found in the sources", "no documentation found"
+    "not in sources","not in the sources","not present in the sources","i could not find",
+    "no supporting source","no evidence in the sources","not found in the sources","no documentation found"
   ];
   return markers.some(m => low.includes(m));
 }
@@ -76,82 +84,130 @@ export default async function handler(req) {
     const userQuery = (messages[messages.length - 1].content || "").trim();
     if (!userQuery) return badRequest("Empty user query");
 
-    // Create conversationHistory array from previous messages (all except last)
     const conversationHistory = (messages || []).slice(0, -1);
 
-    // quick greeting short-circuit
+    // Greeting short-circuit
     if (/^(hi|hello|hey|good (morning|afternoon|evening))\b/i.test(userQuery) && userQuery.split(/\s+/).length <= 4) {
-      const greetResp = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [{ role: "system", content: "You are a warm, succinct assistant. Greet briefly." }, { role: "user", content: userQuery }],
-        max_tokens: 80, temperature: 0.2,
-      });
-      const greet = greetResp?.choices?.[0]?.message?.content?.trim() || "Hello! How can I help?";
-      return okJSON({ rag: { answer: greet, sources: [] }, fallback: null, path: "greet" });
+      try {
+        const greetResp = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: "You are a warm succinct immigration assistant. Greet briefly." },
+            { role: "user", content: userQuery }
+          ],
+          max_tokens: 80,
+          temperature: 0.2,
+        });
+        const greet = greetResp?.choices?.[0]?.message?.content?.trim() || "Hello! How can I help?";
+        return okJSON({ rag: { answer: greet, sources: [] }, fallback: null, path: "greet" });
+      } catch (gerr) {
+        return okJSON({ rag: { answer: "Hello! How can I help?", sources: [] }, fallback: null, path: "greet" });
+      }
     }
 
-    // 1) Router uses conversationHistory to create refined query & intent
-    const { refined_query, intent, format } = await routeQuery(userQuery, conversationHistory);
+    // 1) Router (use conversationHistory)
+    let refined_query = userQuery;
+    let intent = "question";
+    let format = "paragraph";
+    try {
+      const r = await routeQuery(userQuery, conversationHistory);
+      refined_query = r.refined_query || refined_query;
+      intent = r.intent || intent;
+      format = r.format || format;
+    } catch (rerr) {
+      console.warn("routeQuery failed:", rerr?.message || rerr);
+    }
 
-    // 2) Retrieval (pgvector) using refined_query
-    const candidateRows = await retrieveCandidates(refined_query, { limit: 20 });
+    // 2) Retrieval
+    let candidateRows = [];
+    try {
+      candidateRows = await retrieveCandidates(refined_query, { limit: 20 });
+    } catch (cre) {
+      console.warn("retrieveCandidates failed:", cre?.message || cre);
+      candidateRows = [];
+    }
 
+    // If no candidates -> fallback-only (conversationHistory passed into fallback)
     if (!candidateRows || candidateRows.length === 0) {
-      // fallback only, but keep links mapped to sources
-      const fallback = await getGeneralAnswer(userQuery, conversationHistory);
-      const rawUrls = fallback.raw_urls || [];
-      const linkInfo = await verifyUrls(rawUrls, { maxUrls: 6, perUrlTimeout: 2000 }).catch(() => rawUrls.map(u => ({ url: u, ok: null, status: null })));
-      const sources = (linkInfo && linkInfo.length) ? linkInfo.map((l, i) => ({ id: i+1, title: l.url, url: l.url, ok: l.ok, status: l.status })) : rawUrls.slice(0,6).map((u,i) => ({ id: i+1, title: u, url: u }));
-      // prepend disclaimer server-side (frontend will display it)
+      let fallback = { answer: "Sorry — couldn't fetch a general answer right now.", raw_urls: [] };
+      try { fallback = await getGeneralAnswer(userQuery, conversationHistory); } catch (ferr) { console.warn("getGeneralAnswer error:", ferr); }
+
+      const { cleanedText, urlsInText } = stripInlineLinks(fallback.answer || "");
+      const rawUrls = (fallback.raw_urls && fallback.raw_urls.length) ? fallback.raw_urls : urlsInText;
+      let linkInfo = [];
+      try { linkInfo = await verifyUrls(rawUrls, { maxUrls: 6, perUrlTimeout: 2000 }); } catch (verr) { console.warn("verifyUrls error:", verr); linkInfo = (rawUrls || []).slice(0,6).map(u => ({ url: u, ok: null, status: null })); }
+
+      const sources = (linkInfo && linkInfo.length)
+        ? linkInfo.map((l,i) => ({ id: i+1, title: l.url, url: l.url, ok: l.ok, status: l.status }))
+        : (rawUrls || []).slice(0,6).map((u,i) => ({ id: i+1, title: u, url: u }));
+
       const disclaimer = "Disclaimer: Based on general knowledge (not verified sources). Please consult official sources for legal decisions.\n\n";
-      const cleaned = (fallback.answer || "").startsWith("Disclaimer:") ? fallback.answer : disclaimer + (fallback.answer || "");
-      return okJSON({ answer: cleaned, sources, fallback_links: linkInfo, path: "fallback" });
+      const replyText = cleanedText.toLowerCase().startsWith("disclaimer:") ? cleanedText : disclaimer + cleanedText;
+      return okJSON({ answer: replyText, sources, fallback_links: linkInfo, path: "fallback" });
     }
 
-    // 3) Build candidates and rerank
+    // 3) Prepare candidates for reranking
     const candidates = candidateRows.map((r, i) => ({
       id: r.id || i+1,
       content: (r.content || "").slice(0, 1600),
       source_title: r.source_title,
       source_url: r.source_url,
-      source_file: r.source_file
+      source_file: r.source_file,
     }));
 
-    const reranked = await rerankCandidates(refined_query, candidates, Math.min(6, candidates.length));
+    // 4) Rerank
+    let reranked = [];
+    try { reranked = await rerankCandidates(refined_query, candidates, Math.min(6, candidates.length)); }
+    catch (rrerr) { console.warn("rerankCandidates failed:", rrerr?.message || rrerr); reranked = candidates.map((c,i)=>({...c, score: 0.5 - i*0.02})).slice(0, Math.min(6,candidates.length)); }
 
-    // 4) Confidence check using reranked
+    // 5) Confidence check
     const confident = isConfident(reranked);
 
     if (!confident) {
-      const fallback = await getGeneralAnswer(userQuery, conversationHistory);
-      const rawUrls = fallback.raw_urls || [];
-      const linkInfo = await verifyUrls(rawUrls, { maxUrls: 6, perUrlTimeout: 2000 }).catch(() => rawUrls.map(u => ({ url: u, ok: null, status: null })));
+      // fallback but include attempted sources
+      let fallback = { answer: "Sorry — couldn't fetch a general answer right now.", raw_urls: [] };
+      try { fallback = await getGeneralAnswer(userQuery, conversationHistory); } catch (ferr) { console.warn("getGeneralAnswer error:", ferr); }
+      const { cleanedText, urlsInText } = stripInlineLinks(fallback.answer || "");
+      const rawUrls = (fallback.raw_urls && fallback.raw_urls.length) ? fallback.raw_urls : urlsInText;
+      let linkInfo = [];
+      try { linkInfo = await verifyUrls(rawUrls, { maxUrls: 6, perUrlTimeout: 2000 }); } catch (verr) { linkInfo = (rawUrls||[]).slice(0,6).map(u=>({url:u,ok:null,status:null})); }
       const sources = (linkInfo && linkInfo.length) ? linkInfo.map((l,i)=>({ id: i+1, title: l.url, url: l.url, ok: l.ok, status: l.status })) : rawUrls.slice(0,6).map((u,i)=>({ id: i+1, title: u, url: u }));
       const disclaimer = "Disclaimer: Based on general knowledge (not verified sources). Please consult official sources for legal decisions.\n\n";
-      const cleaned = (fallback.answer || "").startsWith("Disclaimer:") ? fallback.answer : disclaimer + (fallback.answer || "");
-      return okJSON({ answer: cleaned, sources, fallback_links: linkInfo, path: "fallback", reason: "pre_synthesis_low_confidence" });
+      const replyText = cleanedText.toLowerCase().startsWith("disclaimer:") ? cleanedText : disclaimer + cleanedText;
+      return okJSON({ answer: replyText, sources, fallback_links: linkInfo, path: "fallback", reason: "pre_synthesis_low_confidence" });
     }
 
-    // 5) Synthesize using top reranked docs and pass conversationHistory so the answer is conversationally aware
+    // 6) Synthesize (pass conversationHistory)
     const topDocs = reranked.map(d => ({ id: d.id, content: d.content, source_title: d.source_title, source_url: d.source_url, score: d.score }));
-    const final = await synthesizeRAGAnswer(topDocs, userQuery, intent, conversationHistory);
-
-    // 6) Post-check synthesis coverage
-    const synthText = final?.answer || "";
-    const hasMissing = synthesisHasMissingMarkers(synthText);
-
-    if (hasMissing) {
-      const fallback = await getGeneralAnswer(userQuery, conversationHistory);
-      const rawUrls = fallback.raw_urls || [];
-      const linkInfo = await verifyUrls(rawUrls, { maxUrls: 6, perUrlTimeout: 2000 }).catch(() => rawUrls.map(u => ({ url: u, ok: null, status: null })));
+    let final;
+    try { final = await synthesizeRAGAnswer(topDocs, userQuery, intent, conversationHistory); }
+    catch (synthErr) {
+      console.warn("synthesizeRAGAnswer failed:", synthErr?.message || synthErr);
+      const fallback = await getGeneralAnswer(userQuery, conversationHistory).catch(()=>({ answer: "Sorry — couldn't fetch a general answer right now.", raw_urls: [] }));
+      const { cleanedText, urlsInText } = stripInlineLinks(fallback.answer || "");
+      const rawUrls = (fallback.raw_urls && fallback.raw_urls.length) ? fallback.raw_urls : urlsInText;
+      const linkInfo = await verifyUrls(rawUrls, { maxUrls: 6, perUrlTimeout: 2000 }).catch(()=> (rawUrls||[]).slice(0,6).map(u=>({url:u,ok:null,status:null})));
       const sources = (linkInfo && linkInfo.length) ? linkInfo.map((l,i)=>({ id: i+1, title: l.url, url: l.url, ok: l.ok, status: l.status })) : rawUrls.slice(0,6).map((u,i)=>({ id: i+1, title: u, url: u }));
       const disclaimer = "Disclaimer: Based on general knowledge (not verified sources). Please consult official sources for legal decisions.\n\n";
-      const cleaned = (fallback.answer || "").startsWith("Disclaimer:") ? fallback.answer : disclaimer + (fallback.answer || "");
-      return okJSON({ answer: cleaned, sources, fallback_links: linkInfo, path: "fallback", reason: "synthesis_incomplete" });
+      const replyText = cleanedText.toLowerCase().startsWith("disclaimer:") ? cleanedText : disclaimer + cleanedText;
+      return okJSON({ answer: replyText, sources, fallback_links: linkInfo, path: "fallback", reason: "synth_error" });
     }
 
-    // 7) OK — return RAG result (final should include final.sources)
-    const rag_sources = final.sources && final.sources.length ? final.sources : topDocs.map((d,i)=>({ id: i+1, title: d.source_title || d.source_file || `source ${i+1}`, url: d.source_url || null }));
+    // 7) Post-synthesis check: missing coverage
+    const synthText = final?.answer || "";
+    if (synthesisHasMissingMarkers(synthText)) {
+      const fallback = await getGeneralAnswer(userQuery, conversationHistory).catch(()=>({ answer: "Sorry — couldn't fetch a general answer right now.", raw_urls: [] }));
+      const { cleanedText, urlsInText } = stripInlineLinks(fallback.answer || "");
+      const rawUrls = (fallback.raw_urls && fallback.raw_urls.length) ? fallback.raw_urls : urlsInText;
+      const linkInfo = await verifyUrls(rawUrls, { maxUrls: 6, perUrlTimeout: 2000 }).catch(()=> (rawUrls||[]).slice(0,6).map(u=>({url:u,ok:null,status:null})));
+      const sources = (linkInfo && linkInfo.length) ? linkInfo.map((l,i)=>({ id: i+1, title: l.url, url: l.url, ok: l.ok, status: l.status })) : rawUrls.slice(0,6).map((u,i)=>({ id: i+1, title: u, url: u }));
+      const disclaimer = "Disclaimer: Based on general knowledge (not verified sources). Please consult official sources for legal decisions.\n\n";
+      const replyText = cleanedText.toLowerCase().startsWith("disclaimer:") ? cleanedText : disclaimer + cleanedText;
+      return okJSON({ answer: replyText, sources, fallback_links: linkInfo, path: "fallback", reason: "synthesis_incomplete" });
+    }
+
+    // 8) Success: return RAG result (final.sources or topDocs -> mapped)
+    const rag_sources = (final && final.sources && final.sources.length) ? final.sources : topDocs.map((d,i)=>({ id: i+1, title: d.source_title || d.source_file || `source ${i+1}`, url: d.source_url || null, excerpt: d.content && d.content.slice(0,400) }));
     return okJSON({ rag: { answer: final.answer, sources: rag_sources }, fallback: null, path: "rag" });
 
   } catch (err) {
