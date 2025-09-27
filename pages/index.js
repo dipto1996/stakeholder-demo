@@ -1,14 +1,11 @@
 // pages/index.js
 import { useState, useRef, useEffect } from "react";
 import Sidebar from "../components/Sidebar";
+import { useSession, signIn, signOut } from "next-auth/react";
 
-/* ---------------------------
-   Small markdown-ish renderer
-   - **bold**
-   - "- " lists
-   - simple tables that start with "|"
-   - newline -> <br/>
-   --------------------------- */
+/* -- markdown functions unchanged (omitted here for brevity) -- */
+// ... (include your simpleMarkdownToHtml and markdownTableToHtml functions exactly as before)
+// For conciseness I will re-include them below in the full file.
 
 function simpleMarkdownToHtml(md = "") {
   if (!md) return "";
@@ -86,11 +83,13 @@ function markdownTableToHtml(tblLines = []) {
    --------------------------- */
 
 export default function ChatPage() {
+  const { data: session, status } = useSession();
+  const signedIn = !!session;
   const [messages, setMessages] = useState([]); // { role, content, path, sources? }
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [expandedSourcesFor, setExpandedSourcesFor] = useState(null);
-  const [sidebarConversation, setSidebarConversation] = useState(null); // new: holds selected conv meta
+  const [sidebarRefreshKey, setSidebarRefreshKey] = useState(0); // bump to refresh sidebar
   const endRef = useRef(null);
 
   useEffect(() => {
@@ -260,15 +259,13 @@ export default function ChatPage() {
     );
   }
 
-  // New: load a conversation when selected in sidebar
+  // When a sidebar conversation is selected, try to load messages
   async function onSelectConversation(conv) {
     if (!conv) return;
-    // If conv already has messages, use them
     if (conv.messages && Array.isArray(conv.messages)) {
       setMessages(conv.messages);
       return;
     }
-    // Otherwise try to fetch the conversation by id
     try {
       const id = conv.id;
       if (!id) {
@@ -294,21 +291,84 @@ export default function ChatPage() {
     }
   }
 
+  // Save current chat and start a new conversation
+  async function onNewConversation() {
+    // If no messages, just clear
+    if (!messages || messages.length === 0) {
+      setMessages([]);
+      // bump sidebar refresh anyway (optional)
+      setSidebarRefreshKey(k => k + 1);
+      return;
+    }
+
+    // Ensure user is signed in to save
+    if (!signedIn) {
+      const ok = confirm("You must be signed in to save conversations. Sign in now?");
+      if (ok) {
+        signIn();
+      }
+      return;
+    }
+
+    // build a simple title from first user message or time
+    const firstUser = messages.find(m => m.role === "user");
+    const title = firstUser ? (firstUser.content.slice(0, 80)) : `Conversation ${new Date().toLocaleString()}`;
+
+    try {
+      const resp = await fetch("/api/conversations/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, messages }),
+      });
+
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        throw new Error(data?.error || `Save failed (${resp.status})`);
+      }
+
+      // success: clear messages (start a new chat) and refresh sidebar
+      setMessages([]);
+      setSidebarRefreshKey(k => k + 1);
+      // optional: show a brief toast (alert for now)
+      alert("Conversation saved.");
+    } catch (err) {
+      console.error("save conversation error:", err);
+      alert("Could not save conversation: " + (err?.message || "Unknown error"));
+    }
+  }
+
+  // Save and new can also be exposed as a header control; we'll display profile and sign in/out
   return (
     <div style={{ display: "flex", height: "100vh", fontFamily: "Inter, system-ui, sans-serif" }}>
-      {/* Sidebar on the left (new) */}
-      <Sidebar onSelectConversation={onSelectConversation} />
+      {/* Sidebar */}
+      <Sidebar onSelectConversation={onSelectConversation} onNewConversation={onNewConversation} refreshKey={sidebarRefreshKey} />
 
-      {/* Main chat area (existing UI preserved) */}
+      {/* Main chat area */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
         <header style={{ position: "relative", padding: 16, borderBottom: "1px solid #eee", background: "#fff" }}>
           <h2 style={{ margin: 0 }}>Immigration AI Assistant</h2>
           <div style={{ color: "#666", fontSize: 13 }}>Informational Tool — Not Legal Advice</div>
 
-          <div style={{ position: "absolute", right: 16, top: 12 }}>
-            <a href="/login" style={{ padding: "8px 12px", background: "#0b63d8", color: "#fff", borderRadius: 8, textDecoration: "none" }}>
-              Sign in / Sign up
-            </a>
+          <div style={{ position: "absolute", right: 16, top: 12, display: "flex", gap: 12, alignItems: "center" }}>
+            {signedIn ? (
+              <>
+                {session.user?.image ? (
+                  <img src={session.user.image} alt="profile" style={{ width: 32, height: 32, borderRadius: 999 }} />
+                ) : (
+                  <div style={{ width: 32, height: 32, borderRadius: 999, background: "#ddd", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    {session.user?.name?.[0]?.toUpperCase() || (session.user?.email?.[0]?.toUpperCase()) || "U"}
+                  </div>
+                )}
+                <div style={{ fontSize: 13, color: "#333" }}>{session.user?.name || session.user?.email}</div>
+                <button onClick={() => signOut()} style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #ddd", background: "#fff", cursor: "pointer" }}>
+                  Sign out
+                </button>
+              </>
+            ) : (
+              <button onClick={() => signIn()} style={{ padding: "8px 12px", background: "#0b63d8", color: "#fff", borderRadius: 8, textDecoration: "none", border: "none", cursor: "pointer" }}>
+                Sign in / Sign up
+              </button>
+            )}
           </div>
         </header>
 
