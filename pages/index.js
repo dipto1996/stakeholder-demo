@@ -2,19 +2,11 @@
 import { useState, useRef, useEffect } from "react";
 
 function simpleMarkdownToHtml(md = "") {
-  // VERY small and safe markdown-ish transformer:
-  // - **bold**
-  // - lines starting with "- " -> list items
-  // - simple newlines to <br/>
   let s = md
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
-
-  // bold **text**
   s = s.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
-
-  // convert lines starting with "- " into <li> items, grouped into <ul>
   const lines = s.split("\n");
   let out = [];
   let inList = false;
@@ -45,9 +37,7 @@ export default function ChatPage() {
   const [expandedSourcesFor, setExpandedSourcesFor] = useState(null);
   const endRef = useRef(null);
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
   async function handleSubmit(e) {
     e?.preventDefault();
@@ -67,65 +57,28 @@ export default function ChatPage() {
       const data = await resp.json();
       if (!resp.ok) throw new Error(data?.error || resp.statusText);
 
-      // Handle both older simple shape and new dual shape
+      // Handle new shapes:
+      // - rag-only: { rag: {answer, sources}, path: "rag" }
+      // - fallback-only: { answer, sources: [], fallback_links, path: "fallback" }
+      // - greet: { rag: {answer, sources: []}, path: "greet" }
+      // - legacy: { answer, sources }
       if (data.path === "rag" && data.rag) {
-        // new shape rag-only
-        setMessages((m) => [
-          ...m,
-          {
-            role: "assistant",
-            content: data.rag.answer || "",
-            path: "rag",
-            sources: data.rag.sources || [],
-          },
-        ]);
-      } else if (data.path === "dual") {
-        // we show rag first (if present) then fallback
-        if (data.rag && data.rag.answer) {
-          setMessages((m) => [
-            ...m,
-            {
-              role: "assistant",
-              content: data.rag.answer,
-              path: "rag",
-              sources: data.rag.sources || [],
-            },
-          ]);
-        } else if (data.rag && data.rag.sources && data.rag.sources.length > 0) {
-          // show a short note that we attempted rag but couldn't synthesize
-          setMessages((m) => [
-            ...m,
-            {
-              role: "assistant",
-              content:
-                "I attempted to find verified sources but couldn't fully synthesize a complete answer from them.",
-              path: "rag",
-              sources: data.rag.sources || [],
-            },
-          ]);
-        }
-
-        if (data.fallback) {
-          setMessages((m) => [
-            ...m,
-            {
-              role: "assistant",
-              content: data.fallback.answer || "",
-              path: "fallback",
-              fallbackLinks: data.fallback.links || [],
-            },
-          ]);
-        }
-      } else if (data.answer && data.sources) {
-        // legacy shape: {answer, sources}
-        setMessages((m) => [
-          ...m,
-          { role: "assistant", content: data.answer, path: data.sources && data.sources.length > 0 ? "rag" : "fallback", sources: data.sources || [] },
-        ]);
+        setMessages((m) => [...m, { role: "assistant", content: data.rag.answer || "", path: "rag", sources: data.rag.sources || [] }]);
+      } else if (data.path === "greet" && data.rag) {
+        // greet — don't mark as fallback
+        setMessages((m) => [...m, { role: "assistant", content: data.rag.answer || "", path: "greet", sources: data.rag.sources || [] }]);
+      } else if (data.path === "fallback") {
+        // fallback-only: show fallback answer and links in source panel
+        setMessages((m) => [...m, { role: "assistant", content: data.answer || "", path: "fallback", fallbackLinks: data.fallback_links || [] }]);
+      } else if (data.answer && Array.isArray(data.sources)) {
+        // legacy shape
+        const path = (data.sources && data.sources.length > 0) ? "rag" : "fallback";
+        setMessages((m) => [...m, { role: "assistant", content: data.answer || "", path, sources: data.sources || [], fallbackLinks: data.fallback_links || [] }]);
       } else {
-        // unknown shape, just show raw
+        // Unknown shape — show raw
         setMessages((m) => [...m, { role: "assistant", content: JSON.stringify(data), path: "fallback" }]);
       }
+
     } catch (err) {
       console.error("chat error:", err);
       setMessages((m) => [...m, { role: "assistant", content: "Sorry — something went wrong.", path: "fallback" }]);
@@ -177,7 +130,7 @@ export default function ChatPage() {
     if (!links || links.length === 0) return null;
     return (
       <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed #eee", background: "#fff8f0" }}>
-        <div style={{ fontSize: 12, color: "#8a4b00", fontWeight: 700 }}>Links (from fallback)</div>
+        <div style={{ fontSize: 12, color: "#8a4b00", fontWeight: 700 }}>Links</div>
         <div style={{ marginTop: 8 }}>
           {links.map((l) => (
             <div key={l.url} style={{ fontSize: 13, marginBottom: 6 }}>
@@ -228,7 +181,7 @@ export default function ChatPage() {
           {!isUser && m.path === "fallback" && m.fallbackLinks && (
             <div style={{ marginTop: 8 }}>
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                <div style={{ fontSize: 12, color: "#8a4b00", fontWeight: 700 }}>Fallback (unverified)</div>
+                <div style={{ fontSize: 12, color: "#8a4b00", fontWeight: 700 }}>Links</div>
               </div>
               {renderFallbackLinks(m.fallbackLinks)}
             </div>
