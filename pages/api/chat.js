@@ -1,182 +1,122 @@
-// pages/api/chat.js — Polished, non-streaming JSON handler (Edge)
-// - Edge runtime + @vercel/postgres
-// - Robust retries for embeddings & completions
-// - Smart context trimming
-// - Clean, friendly, well-structured answers with [1][2] citations
-// - Returns { answer, sources } JSON (compatible with your current index.js)
+// pages/api/chat.js
+import { sql } from "@vercel/postgres";
+import openai from "../../lib/openaiClient.js";
+import { routeQuery } from "../../lib/rag/router.js";
+import { createQueryEmbedding, retrieveCandidates } from "../../lib/rag/retriever.js";
+import { rerankCandidates } from "../../lib/rag/reranker.js";
+import { isConfident } from "../../lib/rag/confidence.js";
+import { synthesizeRAGAnswer } from "../../lib/rag/synthesizer.js";
+import { getGeneralAnswer } from "../../lib/rag/fallback.js";
 
-import OpenAI from 'openai';
-import { sql } from '@vercel/postgres';
+export const config = { runtime: "edge" };
 
-export const config = { runtime: 'edge' };
+const EMBEDDING_MODEL = "text-embedding-3-small";
+const MAX_EXCERPT = 1600;
+const MAX_CONTEXT_TOTAL = 6000;
+const RETRIEVE_LIMIT = 20;
+const FINAL_TOP_K = 6;
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// ---- Tunables ----
-const EMBEDDING_MODEL = 'text-embedding-3-small';
-const CHAT_MODEL = 'gpt-4o-mini';
-const EMB_RETRIES = 3;
-const CHAT_RETRIES = 2;
-const MAX_EXCERPT = 1600;       // per source excerpt, chars
-const MAX_CONTEXT_TOTAL = 6000; // total chars across all excerpts
-
-async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-async function withRetry(fn, tries = 3) {
-  let lastErr;
-  for (let i = 0; i < tries; i++) {
-    try { return await fn(); } catch (e) { lastErr = e; await sleep(2 ** i * 500); }
-  }
-  throw lastErr;
+function okJSON(obj) {
+  return new Response(JSON.stringify(obj), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+function badRequest(msg) {
+  return new Response(JSON.stringify({ error: msg }), { status: 400, headers: { "Content-Type": "application/json" } });
 }
 
-async function embed(text) {
-  const resp = await withRetry(
-    () => openai.embeddings.create({ model: EMBEDDING_MODEL, input: text }),
-    EMB_RETRIES
-  );
-  const v = resp?.data?.[0]?.embedding;
-  if (!v) throw new Error('Embedding failed');
-  return v;
-}
-
+// buildContextRows similar to earlier
 function buildContextRows(rows) {
-  // Build sources + trimmed context respecting total budget
   const sources = rows.map((r, i) => ({
     id: i + 1,
-    title: r.source_title || r.source_file || 'Untitled',
+    title: r.source_title || r.source_file || "Untitled",
     url: r.source_url || null,
   }));
 
   let used = 0;
   const blocks = [];
   for (let i = 0; i < rows.length; i++) {
-    const raw = (rows[i].content || '').slice(0, MAX_EXCERPT);
+    const raw = (rows[i].content || "").slice(0, MAX_EXCERPT);
     if (used + raw.length > MAX_CONTEXT_TOTAL) break;
-    blocks.push(
-      `[${i + 1}] source: ${rows[i].source_title || rows[i].source_file || 'Untitled'}\ncontent: ${raw}`
-    );
+    blocks.push(`[${i + 1}] source: ${rows[i].source_title || rows[i].source_file || 'Untitled'}\ncontent: ${raw}`);
     used += raw.length;
   }
-  return { sources, contextText: blocks.join('\n\n---\n\n') };
-}
-
-function okJSON(obj) {
-  return new Response(JSON.stringify(obj), {
-    status: 200,
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
-
-function badRequest(msg) {
-  return new Response(JSON.stringify({ error: msg }), {
-    status: 400,
-    headers: { 'Content-Type': 'application/json' },
-  });
+  return { sources, contextText: blocks.join("\n\n---\n\n") };
 }
 
 export default async function handler(req) {
-  if (req.method !== 'POST') {
-    return new Response('Method Not Allowed', { status: 405 });
-  }
-
+  if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
   try {
     const body = await req.json();
     const { messages } = body || {};
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return badRequest('Invalid request body');
-    }
+    if (!Array.isArray(messages) || messages.length === 0) return badRequest("Invalid request body");
 
-    const userQuery = (messages[messages.length - 1].content || '').trim();
-    if (!userQuery) return badRequest('Empty user query');
+    const userQuery = (messages[messages.length - 1].content || "").trim();
+    if (!userQuery) return badRequest("Empty user query");
 
-    // Lightweight greeting path (still via model for consistent style)
+    // quick greeting path to keep responses fast for salutations
     if (/^(hi|hello|hey|good (morning|afternoon|evening))\b/i.test(userQuery)) {
-      const greet = await withRetry(
-        () => openai.chat.completions.create({
-          model: CHAT_MODEL,
-          stream: false,
-          temperature: 0.2,
-          messages: [
-            { role: 'system', content:
-              'You are a warm, succinct immigration info assistant. Greet briefly and ask how you can help.' },
-            { role: 'user', content: userQuery },
-          ],
-        }),
-        CHAT_RETRIES
-      );
-      const content = greet?.choices?.[0]?.message?.content?.trim() || 'Hello! How can I help?';
-      return okJSON({ answer: content, sources: [] });
-    }
-
-    // --- RAG retrieval ---
-    const qEmbedding = await embed(userQuery);
-
-    const { rows } = await sql`
-      SELECT content, source_title, source_url, source_file
-      FROM documents
-      ORDER BY embedding <=> ${JSON.stringify(qEmbedding)}::vector
-      LIMIT 6
-    `;
-
-    if (!rows || rows.length === 0) {
-      const msg =
-        "I couldn't find supporting official sources in the provided documents.\n\n" +
-        "**Next steps:**\n- Rephrase your question or add specifics (form number, visa type, date range).\n" +
-        "- I can also try a broader explanation if you’d like.";
-      return okJSON({ answer: msg, sources: [] });
-    }
-
-    const { sources, contextText } = buildContextRows(rows);
-
-    // --- Prompting for polished answers ---
-    const systemPrompt = `
-You are a friendly, precise assistant for U.S. immigration information.
-Requirements:
-- Base your answer ONLY on the CONTEXT. If missing, say so plainly.
-- Be concise but helpful. Use markdown with these sections:
-  **Answer:** (2–4 sentences max, straight to the point)
-  **Key Points:** (3–5 bullets, compact)
-  **Next Steps:** (up to 3 bullets, action-oriented)
-- Cite facts using bracketed numbers [1], [2] that correspond to the sources order below.
-- Avoid legal advice. No filler language. Keep formatting clean.
-- If the user asked about fees/policies that change, include a short “check latest on USCIS” note with a citation if present.
-
-Output ONLY the formatted markdown answer (no JSON).`;
-
-    const userPrompt =
-`CONTEXT:
-${contextText}
-
-QUESTION:
-${userQuery}
-`;
-
-    const completion = await withRetry(
-      () => openai.chat.completions.create({
-        model: CHAT_MODEL,
-        stream: false,
-        temperature: 0.2,
+      const greetResp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
         messages: [
-          { role: 'system', content: systemPrompt.trim() },
-          { role: 'user', content: userPrompt },
+          { role: "system", content: "You are a warm, succinct immigration info assistant. Greet briefly and ask how you can help." },
+          { role: "user", content: userQuery },
         ],
-      }),
-      CHAT_RETRIES
-    );
-
-    let answer = completion?.choices?.[0]?.message?.content?.trim() || '';
-    if (!answer) {
-      answer =
-        "Sorry — I couldn't generate a confident answer from the provided sources. " +
-        "Try rephrasing or asking a more specific question.";
+        max_tokens: 80,
+        temperature: 0.2,
+      });
+      const greet = greetResp?.choices?.[0]?.message?.content?.trim() || "Hello! How can I help?";
+      return okJSON({ answer: greet, sources: [] });
     }
 
-    // Return JSON for your current UI
-    return okJSON({ answer, sources });
+    // 1) Router
+    const conversationHistory = (messages || []).slice(0, -1);
+    const { refined_query, intent, format } = await routeQuery(userQuery, conversationHistory);
 
+    // 2) Retriever (attempt pgvector via retrieveCandidates)
+    const candidateRows = await retrieveCandidates(refined_query, { limit: RETRIEVE_LIMIT });
+
+    // If no candidates (pgvector not present or empty), fallback to general answer
+    if (!candidateRows || candidateRows.length === 0) {
+      const fallback = await getGeneralAnswer(userQuery);
+      return okJSON({ answer: fallback.answer, sources: [] });
+    }
+
+    // 3) Build candidate objects for reranker
+    const candidates = candidateRows.map((r, i) => ({
+      id: r.id || i + 1,
+      content: (r.content || "").slice(0, MAX_EXCERPT),
+      source_title: r.source_title,
+      source_url: r.source_url,
+      source_file: r.source_file,
+    }));
+
+    // 4) Rerank
+    const reranked = await rerankCandidates(refined_query, candidates, Math.min(FINAL_TOP_K, candidates.length));
+
+    // 5) Confidence check
+    const confident = isConfident(reranked);
+
+    // 6) Choose path
+    if (confident) {
+      const topDocs = reranked.map((d) => ({
+        id: d.id,
+        content: d.content,
+        source_title: d.source_title,
+        source_url: d.source_url,
+        source_file: d.source_file,
+        score: d.score,
+      }));
+      const final = await synthesizeRAGAnswer(topDocs, userQuery, intent, conversationHistory);
+      // match legacy output shape: { answer, sources }
+      return okJSON({
+        answer: final.answer,
+        sources: final.sources.map((s) => ({ id: s.id, title: s.title, url: s.url })),
+      });
+    } else {
+      const fallback = await getGeneralAnswer(userQuery);
+      return okJSON({ answer: fallback.answer, sources: [] });
+    }
   } catch (err) {
-    console.error('chat api error:', err);
-    return new Response('Internal Server Error', { status: 500 });
+    console.error("chat api error:", err);
+    return new Response("Internal Server Error", { status: 500 });
   }
 }
