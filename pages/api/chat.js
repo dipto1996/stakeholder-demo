@@ -2,7 +2,7 @@
 import { sql } from "@vercel/postgres";
 import openai from "../../lib/openaiClient.js";
 import { routeQuery } from "../../lib/rag/router.js";
-import { createQueryEmbedding, retrieveCandidates } from "../../lib/rag/retriever.js";
+import { retrieveCandidates } from "../../lib/rag/retriever.js";
 import { rerankCandidates } from "../../lib/rag/reranker.js";
 import { isConfident } from "../../lib/rag/confidence.js";
 import { synthesizeRAGAnswer } from "../../lib/rag/synthesizer.js";
@@ -17,7 +17,7 @@ function badRequest(msg) {
   return new Response(JSON.stringify({ error: msg }), { status: 400, headers: { "Content-Type": "application/json" } });
 }
 
-// Lightweight markdown check: see if synthesizer flagged missing sources
+// Lightweight synthesis missing markers
 function synthesisHasMissingMarkers(text) {
   if (!text) return true;
   const low = text.toLowerCase();
@@ -34,7 +34,7 @@ function synthesisHasMissingMarkers(text) {
   return markers.some((m) => low.includes(m));
 }
 
-// Verify URLs (HEAD) — returns [{ url, ok: true|false, status }]
+// Verify URLs (HEAD), with fallback to GET
 async function verifyUrls(urls = []) {
   const results = [];
   for (const u of urls) {
@@ -42,7 +42,6 @@ async function verifyUrls(urls = []) {
       const resp = await fetch(u, { method: "HEAD", redirect: "follow" });
       results.push({ url: u, ok: resp.ok, status: resp.status });
     } catch (e) {
-      // try GET for some servers that don't accept HEAD
       try {
         const resp2 = await fetch(u, { method: "GET", redirect: "follow" });
         results.push({ url: u, ok: resp2.ok, status: resp2.status });
@@ -52,6 +51,39 @@ async function verifyUrls(urls = []) {
     }
   }
   return results;
+}
+
+/**
+ * numericEvidenceCheck(answerText, docs)
+ * - Extracts numeric tokens / currency from answerText (e.g., "$100,000", "100000", "2025")
+ * - Checks whether any of the docs' excerpts contain those same numeric tokens.
+ * - If answer contains numeric/currency claims but none are found in docs => returns false (no evidence).
+ * - Otherwise returns true (evidence exists or no numeric claims present).
+ *
+ * This helps catch cases where the model invents a fee or date but the retrieved sources don't contain it.
+ */
+function numericEvidenceCheck(answerText = "", docs = []) {
+  if (!answerText) return false; // no answer => treat as missing
+  // find dollar amounts and plain numbers (years or large numbers)
+  const currencyMatches = Array.from(new Set([...answerText.matchAll(/\$\s?[\d,]+(?:\.\d+)?/g)].map(m => m[0].replace(/\s+/g, ""))));
+  const plainNumberMatches = Array.from(new Set([...answerText.matchAll(/\b\d{4}\b|\b\d{3,}\b/g)].map(m => m[0])));
+
+  const numericCandidates = [...currencyMatches, ...plainNumberMatches].map(s => s.replace(/[,]/g, "").toLowerCase());
+  if (numericCandidates.length === 0) return true; // no numeric claims => OK
+
+  // Normalize docs text and check for presence of numeric tokens
+  const lowerDocs = docs.map(d => (d.content || "").replace(/[,]/g, "").toLowerCase());
+  for (const token of numericCandidates) {
+    for (const dtext of lowerDocs) {
+      if (!dtext) continue;
+      if (dtext.includes(token)) return true; // evidence found
+      // sometimes $ is absent in source but number present with whitespace/punctuation; check digits-only
+      const digitsOnly = token.replace(/\D/g, "");
+      if (digitsOnly && dtext.includes(digitsOnly)) return true;
+    }
+  }
+  // none of the numeric tokens are present in any doc excerpt
+  return false;
 }
 
 export default async function handler(req) {
@@ -84,13 +116,12 @@ export default async function handler(req) {
     const conversationHistory = (messages || []).slice(0, -1);
     const { refined_query, intent, format } = await routeQuery(userQuery, conversationHistory);
 
-    // 2) Retrieval (pgvector path)
+    // 2) Retrieval
     const candidateRows = await retrieveCandidates(refined_query, { limit: 20 });
 
-    // If no candidates, do fallback and return dual: rag empty, fallback content
+    // If no candidates, fallback and return dual (RAG empty + fallback)
     if (!candidateRows || candidateRows.length === 0) {
       const fallback = await getGeneralAnswer(userQuery);
-      // verify fallback links (non-blocking if empty)
       const linkInfo = await verifyUrls(fallback.raw_urls || []);
       return okJSON({
         rag: { answer: null, sources: [] },
@@ -114,11 +145,10 @@ export default async function handler(req) {
     // 5) Confidence check (pre-synthesis)
     const confident = isConfident(reranked);
 
-    // If not confident, produce fallback but return dual view: RAG attempted top N + fallback
+    // If not confident -> fallback (dual view), include attempted RAG sources
     if (!confident) {
       const fallback = await getGeneralAnswer(userQuery);
       const linkInfo = await verifyUrls(fallback.raw_urls || []);
-      // Provide the partial RAG candidates (best-effort) too, so UI can show what we attempted
       return okJSON({
         rag: {
           answer: null,
@@ -140,23 +170,24 @@ export default async function handler(req) {
     }));
     const final = await synthesizeRAGAnswer(topDocs, userQuery, intent, conversationHistory);
 
-    // 7) Post-synthesis coverage check:
+    // 7) Post-synthesis checks
     const synthText = (final.answer || "");
     const hasMissing = synthesisHasMissingMarkers(synthText);
+    const numericEvidenceOk = numericEvidenceCheck(synthText, topDocs);
 
-    if (hasMissing) {
-      // fallback to ChatGPT and return both RAG (synth output) and fallback
+    if (hasMissing || !numericEvidenceOk) {
+      // fallback to ChatGPT and return both RAG and fallback (dual)
       const fallback = await getGeneralAnswer(userQuery);
       const linkInfo = await verifyUrls(fallback.raw_urls || []);
       return okJSON({
         rag: { answer: final.answer, sources: final.sources || topDocs.map((d,i)=>({ id: i+1, title: d.source_title, url: d.source_url })) },
         fallback: { answer: fallback.answer, links: linkInfo },
         path: "dual",
-        reason: "synthesis_incomplete"
+        reason: hasMissing ? "synthesis_incomplete" : "numeric_mismatch"
       });
     }
 
-    // 8) All good — return RAG-only (still included under rag key for consistency)
+    // 8) All good — return RAG-only
     return okJSON({
       rag: { answer: final.answer, sources: final.sources || topDocs.map((d,i)=>({ id: i+1, title: d.source_title, url: d.source_url })) },
       fallback: null,
