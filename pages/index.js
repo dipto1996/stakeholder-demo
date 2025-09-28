@@ -1,11 +1,14 @@
 // pages/index.js
 import { useState, useRef, useEffect } from "react";
-import Sidebar from "../components/Sidebar";
 import { useSession, signIn, signOut } from "next-auth/react";
 
-/* -- markdown functions unchanged (omitted here for brevity) -- */
-// ... (include your simpleMarkdownToHtml and markdownTableToHtml functions exactly as before)
-// For conciseness I will re-include them below in the full file.
+/* ---------------------------
+   Small markdown-ish renderer
+   - **bold**
+   - "- " lists
+   - simple tables that start with "|"
+   - newline -> <br/>
+   --------------------------- */
 
 function simpleMarkdownToHtml(md = "") {
   if (!md) return "";
@@ -79,47 +82,148 @@ function markdownTableToHtml(tblLines = []) {
 }
 
 /* ---------------------------
-   React Component
+   Component
    --------------------------- */
 
 export default function ChatPage() {
   const { data: session, status } = useSession();
-  const signedIn = !!session;
-  const [messages, setMessages] = useState([]); // { role, content, path, sources? }
+  const [messages, setMessages] = useState([]); // { role: 'user'|'assistant', content, sources? }
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // Sidebar state
+  const [savedConversations, setSavedConversations] = useState([]); // {id,title,created_at}
+  const [loadingConvos, setLoadingConvos] = useState(false);
   const [expandedSourcesFor, setExpandedSourcesFor] = useState(null);
-  const [sidebarRefreshKey, setSidebarRefreshKey] = useState(0); // bump to refresh sidebar
+
   const endRef = useRef(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Maximum number of messages (turns) to send to backend (keeps token usage bounded)
+  // When auth state becomes 'authenticated', reload saved convos
+  useEffect(() => {
+    loadConversations();
+  }, [status]);
+
+  // MAX history turns to send to the backend
   const MAX_HISTORY_TURNS = 8;
+
+  /* ---------------------------
+     Conversation list APIs (frontend)
+     --------------------------- */
+
+  async function loadConversations() {
+    setLoadingConvos(true);
+    try {
+      const resp = await fetch("/api/conversations/list");
+      if (resp.status === 401 || resp.status === 404) {
+        // Not signed in or no convos -> show empty list
+        setSavedConversations([]);
+        setLoadingConvos(false);
+        return;
+      }
+      if (!resp.ok) {
+        console.error("Failed to load convos:", resp.status, await resp.text().catch(() => ""));
+        setSavedConversations([]);
+        setLoadingConvos(false);
+        return;
+      }
+      const data = await resp.json().catch(() => null);
+      if (!data || !Array.isArray(data.conversations)) {
+        setSavedConversations([]);
+      } else {
+        setSavedConversations(data.conversations);
+      }
+    } catch (err) {
+      console.error("loadConversations error", err);
+      setSavedConversations([]);
+    } finally {
+      setLoadingConvos(false);
+    }
+  }
+
+  async function openSavedConversation(convId) {
+    if (!convId) return;
+    try {
+      const resp = await fetch(`/api/conversations/${encodeURIComponent(convId)}`);
+      if (resp.status === 401) {
+        alert("Please sign in to open saved conversations.");
+        return;
+      }
+      if (resp.status === 404) {
+        alert("Conversation not found (it may have been deleted).");
+        await loadConversations();
+        return;
+      }
+      if (!resp.ok) {
+        console.error("Failed to load conversation", resp.status, await resp.text().catch(() => ""));
+        alert("Could not load saved conversation (server error).");
+        return;
+      }
+      const data = await resp.json().catch(() => null);
+      if (!data || !Array.isArray(data.messages)) {
+        alert("Saved conversation is invalid or empty.");
+        return;
+      }
+      setMessages(data.messages);
+      setTimeout(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+    } catch (err) {
+      console.error("openSavedConversation error", err);
+      alert("Could not load saved conversation (network error).");
+    }
+  }
+
+  async function saveConversation({ id = null, title = null } = {}) {
+    // Save the current messages as a conversation
+    try {
+      if (!session?.user?.id) {
+        alert("Please sign in to save conversations.");
+        return;
+      }
+      const payload = { id, title, messages };
+      const resp = await fetch("/api/conversations/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok) {
+        const err = await resp.text().catch(() => "");
+        console.error("saveConversation failed:", resp.status, err);
+        alert("Failed to save conversation.");
+        return;
+      }
+      const data = await resp.json().catch(() => null);
+      await loadConversations();
+      if (data && data.id) {
+        alert("Conversation saved.");
+      }
+    } catch (err) {
+      console.error("saveConversation error", err);
+      alert("Failed to save conversation (network).");
+    }
+  }
+
+  /* ---------------------------
+     Chat flow (frontend)
+     --------------------------- */
 
   async function handleSubmit(e) {
     e?.preventDefault();
     const text = (input || "").trim();
     if (!text) return;
 
-    // Build the new message object
     const userMsg = { role: "user", content: text };
-
-    // Build payload messages: take the last MAX_HISTORY_TURNS turns from current messages,
-    // then append the new user message. This ensures backend sees conversation history.
-    const recent = (messages || []).slice(-MAX_HISTORY_TURNS);
-    const payloadMessages = [...recent, userMsg];
-
-    // Echo the user's message into UI immediately
+    // append user msg to UI immediately
     setMessages((m) => [...m, userMsg]);
     setInput("");
     setLoading(true);
 
     try {
-      // Debug: inspect the outgoing payload (remove in production)
-      console.log("Sending to /api/chat payloadMessages:", payloadMessages);
+      // Build payload with last MAX_HISTORY_TURNS of conversation + new user message
+      const recent = (messages || []).slice(-MAX_HISTORY_TURNS);
+      const payloadMessages = [...recent, userMsg];
 
       const resp = await fetch("/api/chat", {
         method: "POST",
@@ -127,47 +231,46 @@ export default function ChatPage() {
         body: JSON.stringify({ messages: payloadMessages }),
       });
 
-      // attempt to parse JSON
       const data = await resp.json().catch(() => null);
-
       if (!resp.ok) {
-        // If server returned non-JSON error, try to present a friendly message
-        const errMsg = (data && data.error) ? data.error : `Status ${resp.status} - ${resp.statusText}`;
-        throw new Error(errMsg);
+        console.error("chat API error:", resp.status, data);
+        setMessages((m) => [...m, { role: "assistant", content: "Sorry — something went wrong.", path: "fallback" }]);
+        return;
       }
 
-      // Normalize backend shapes (rag / fallback / greet / legacy)
+      // Normalize backend shapes
       if (data.path === "rag" && data.rag) {
         setMessages((m) => [...m, { role: "assistant", content: data.rag.answer || "", path: "rag", sources: data.rag.sources || [] }]);
       } else if (data.path === "greet" && data.rag) {
         setMessages((m) => [...m, { role: "assistant", content: data.rag.answer || "", path: "greet", sources: data.rag.sources || [] }]);
       } else if (data.path === "fallback") {
-        // Map fallback_links or sources -> sources array for UI
-        const fromSources = data.sources && Array.isArray(data.sources) && data.sources.length > 0;
-        const links = fromSources ? data.sources : (data.fallback_links || data.fallbackLinks || []);
+        // map fallback_links to sources for consistent display
+        const links = data.fallback_links || data.fallbackLinks || data.sources || [];
         const sources = Array.isArray(links)
           ? links.map((l, idx) => {
               if (!l) return null;
               if (typeof l === "string") return { id: idx + 1, title: l, url: l };
-              return { id: idx + 1, title: l.title || l.url || l, url: l.url || null, ok: l.ok, status: l.status, excerpt: l.excerpt };
+              return { id: idx + 1, title: l.title || l.url || l, url: l.url || null, ok: l.ok, status: l.status };
             }).filter(Boolean)
           : [];
-
         setMessages((m) => [...m, { role: "assistant", content: data.answer || "", path: "fallback", sources }]);
       } else if (data.answer && Array.isArray(data.sources)) {
         const path = data.sources && data.sources.length > 0 ? "rag" : "fallback";
         setMessages((m) => [...m, { role: "assistant", content: data.answer || "", path, sources: data.sources || [] }]);
       } else {
-        // Unknown shape — show raw
-        setMessages((m) => [...m, { role: "assistant", content: JSON.stringify(data), path: "fallback", sources: [] }]);
+        setMessages((m) => [...m, { role: "assistant", content: JSON.stringify(data), path: "fallback" }]);
       }
     } catch (err) {
       console.error("chat error:", err);
-      setMessages((m) => [...m, { role: "assistant", content: "Sorry — something went wrong.", path: "fallback", sources: [] }]);
+      setMessages((m) => [...m, { role: "assistant", content: "Sorry — something went wrong.", path: "fallback" }]);
     } finally {
       setLoading(false);
     }
   }
+
+  /* ---------------------------
+     UI helpers
+     --------------------------- */
 
   function toggleSources(idx) {
     setExpandedSourcesFor((s) => (s === idx ? null : idx));
@@ -259,122 +362,109 @@ export default function ChatPage() {
     );
   }
 
-  // When a sidebar conversation is selected, try to load messages
-  async function onSelectConversation(conv) {
-    if (!conv) return;
-    if (conv.messages && Array.isArray(conv.messages)) {
-      setMessages(conv.messages);
-      return;
-    }
-    try {
-      const id = conv.id;
-      if (!id) {
-        alert("Selected conversation has no id");
-        return;
-      }
-      const r = await fetch(`/api/conversations/get?id=${encodeURIComponent(id)}`);
-      if (!r.ok) {
-        console.warn("Could not fetch conversation, status:", r.status);
-        alert("Could not load saved conversation (server returned " + r.status + ").");
-        return;
-      }
-      const d = await r.json();
-      const msgs = d.conversation?.messages || d.messages || d;
-      if (Array.isArray(msgs)) {
-        setMessages(msgs);
-      } else {
-        alert("Saved conversation did not contain messages.");
-      }
-    } catch (err) {
-      console.error("Load conversation error:", err);
-      alert("Could not load conversation. See console for details.");
-    }
+  /* ---------------------------
+     Sidebar render
+     --------------------------- */
+
+  function Sidebar() {
+    return (
+      <div style={{ width: 260, borderRight: "1px solid #f0f0f0", padding: 12, height: "100vh", boxSizing: "border-box", position: "relative" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+          <div style={{ fontWeight: 700 }}>Chats</div>
+          <button
+            onClick={() => {
+              // Create a new conversation (clear current messages)
+              setMessages([]);
+            }}
+            style={{ padding: "6px 10px", borderRadius: 6, cursor: "pointer" }}
+          >
+            New
+          </button>
+        </div>
+
+        <div style={{ marginBottom: 14 }}>
+          {loadingConvos ? (
+            <div style={{ color: "#666" }}>Loading conversations…</div>
+          ) : savedConversations.length === 0 ? (
+            <div style={{ color: "#999" }}>No saved conversations</div>
+          ) : (
+            <div>
+              {savedConversations.map((c) => (
+                <div key={c.id} style={{ marginBottom: 10, cursor: "pointer" }} onClick={() => openSavedConversation(c.id)}>
+                  <div style={{ background: "#fff", padding: 10, borderRadius: 6, border: "1px solid #eee" }}>
+                    <div style={{ fontWeight: 600 }}>{c.title || "Conversation"}</div>
+                    <div style={{ fontSize: 12, color: "#888", marginTop: 6 }}>{new Date(c.created_at).toLocaleString()}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div style={{ position: "absolute", left: 12, bottom: 40 }}>
+          <div style={{ marginBottom: 10 }}>
+            <a href="/vault" style={{ color: "#1558d6", textDecoration: "none" }}>Vault</a>
+          </div>
+
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ color: "#666", fontSize: 13 }}>Know Your Visa (Beta)</div>
+            <button onClick={() => alert("KYV placeholder")} style={{ marginTop: 6, padding: "6px 10px", borderRadius: 6 }}>Open</button>
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <div style={{ fontSize: 13, color: "#666", marginBottom: 6 }}>Profile</div>
+            {!session ? (
+              <button onClick={() => signIn()} style={{ padding: "6px 10px", borderRadius: 6 }}>Sign in</button>
+            ) : (
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <div style={{ width: 32, height: 32, borderRadius: 999, background: "#ddd", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700 }}>
+                  {session.user.email?.[0]?.toUpperCase() || "U"}
+                </div>
+                <div>
+                  <div style={{ fontSize: 13 }}>{session.user.email}</div>
+                  <button onClick={() => signOut({ callbackUrl: "/" })} style={{ marginTop: 6, padding: "6px 10px", borderRadius: 6 }}>Sign out</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
   }
 
-  // Save current chat and start a new conversation
-  async function onNewConversation() {
-    // If no messages, just clear
-    if (!messages || messages.length === 0) {
-      setMessages([]);
-      // bump sidebar refresh anyway (optional)
-      setSidebarRefreshKey(k => k + 1);
-      return;
-    }
+  /* ---------------------------
+     Layout
+     --------------------------- */
 
-    // Ensure user is signed in to save
-    if (!signedIn) {
-      const ok = confirm("You must be signed in to save conversations. Sign in now?");
-      if (ok) {
-        signIn();
-      }
-      return;
-    }
-
-    // build a simple title from first user message or time
-    const firstUser = messages.find(m => m.role === "user");
-    const title = firstUser ? (firstUser.content.slice(0, 80)) : `Conversation ${new Date().toLocaleString()}`;
-
-    try {
-      const resp = await fetch("/api/conversations/save", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, messages }),
-      });
-
-      const data = await resp.json().catch(() => null);
-      if (!resp.ok) {
-        throw new Error(data?.error || `Save failed (${resp.status})`);
-      }
-
-      // success: clear messages (start a new chat) and refresh sidebar
-      setMessages([]);
-      setSidebarRefreshKey(k => k + 1);
-      // optional: show a brief toast (alert for now)
-      alert("Conversation saved.");
-    } catch (err) {
-      console.error("save conversation error:", err);
-      alert("Could not save conversation: " + (err?.message || "Unknown error"));
-    }
-  }
-
-  // Save and new can also be exposed as a header control; we'll display profile and sign in/out
   return (
     <div style={{ display: "flex", height: "100vh", fontFamily: "Inter, system-ui, sans-serif" }}>
-      {/* Sidebar */}
-      <Sidebar onSelectConversation={onSelectConversation} onNewConversation={onNewConversation} refreshKey={sidebarRefreshKey} />
+      <Sidebar />
 
-      {/* Main chat area */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
         <header style={{ position: "relative", padding: 16, borderBottom: "1px solid #eee", background: "#fff" }}>
           <h2 style={{ margin: 0 }}>Immigration AI Assistant</h2>
           <div style={{ color: "#666", fontSize: 13 }}>Informational Tool — Not Legal Advice</div>
-
-          <div style={{ position: "absolute", right: 16, top: 12, display: "flex", gap: 12, alignItems: "center" }}>
-            {signedIn ? (
-              <>
-                {session.user?.image ? (
-                  <img src={session.user.image} alt="profile" style={{ width: 32, height: 32, borderRadius: 999 }} />
-                ) : (
-                  <div style={{ width: 32, height: 32, borderRadius: 999, background: "#ddd", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                    {session.user?.name?.[0]?.toUpperCase() || (session.user?.email?.[0]?.toUpperCase()) || "U"}
-                  </div>
-                )}
-                <div style={{ fontSize: 13, color: "#333" }}>{session.user?.name || session.user?.email}</div>
-                <button onClick={() => signOut()} style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #ddd", background: "#fff", cursor: "pointer" }}>
-                  Sign out
-                </button>
-              </>
-            ) : (
-              <button onClick={() => signIn()} style={{ padding: "8px 12px", background: "#0b63d8", color: "#fff", borderRadius: 8, textDecoration: "none", border: "none", cursor: "pointer" }}>
+          <div style={{ position: "absolute", right: 16, top: 12 }}>
+            {!session ? (
+              <button onClick={() => signIn()} style={{ padding: "8px 12px", background: "#0b63d8", color: "#fff", borderRadius: 8, border: "none" }}>
                 Sign in / Sign up
               </button>
+            ) : (
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <div style={{ fontSize: 14 }}>{session.user.email}</div>
+                <button onClick={() => signOut({ callbackUrl: "/" })} style={{ padding: "8px 12px", borderRadius: 8 }}>
+                  Sign out
+                </button>
+              </div>
             )}
           </div>
         </header>
 
         <main style={{ flex: 1, overflow: "auto", padding: 20 }}>
           <div style={{ maxWidth: 900, margin: "0 auto" }}>
-            {messages.map((m, idx) => renderMessage(m, idx))}
+            {messages.map((m, idx) => (
+              <div key={idx}>{renderMessage(m, idx)}</div>
+            ))}
             <div ref={endRef} />
           </div>
         </main>
@@ -390,6 +480,14 @@ export default function ChatPage() {
             />
             <button type="submit" disabled={loading} style={{ padding: "10px 14px", borderRadius: 8, background: "#0b63d8", color: "#fff", border: "none" }}>
               {loading ? "Thinking..." : "Send"}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => saveConversation()}
+              style={{ padding: "10px 14px", borderRadius: 8, background: "#f7f7f7", border: "1px solid #ddd", marginLeft: 8 }}
+            >
+              Save
             </button>
           </form>
         </footer>
