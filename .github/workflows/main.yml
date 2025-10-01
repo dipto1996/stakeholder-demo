@@ -32,10 +32,10 @@ jobs:
           GCP_SA_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
         run: |
           python - <<'PY'
-import json, os
-j = json.loads(os.environ['GCP_SA_JSON'])
-print("GCP project:", j.get("project_id"))
-PY
+          import json, os
+          j = json.loads(os.environ['GCP_SA_JSON'])
+          print("GCP project:", j.get("project_id"))
+          PY
 
       - name: Run Data Pipeline
         env:
