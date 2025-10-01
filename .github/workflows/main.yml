@@ -2,15 +2,15 @@ name: Nightly Data Pipeline
 
 on:
   schedule:
-    - cron: '0 5 * * *' # Runs every day at 5 AM UTC
-  workflow_dispatch: # Allows you to run this workflow manually from the Actions tab
+    - cron: '0 5 * * *' # daily 5:00 UTC
+  workflow_dispatch:
 
 jobs:
   build-and-embed:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -27,11 +27,20 @@ jobs:
         with:
           credentials_json: '${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}'
 
+      - name: Verify GCP creds (safe)
+        env:
+          GCP_SA_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+        run: |
+          python - <<'PY'
+import json, os
+j = json.loads(os.environ['GCP_SA_JSON'])
+print("GCP project:", j.get("project_id"))
+PY
+
       - name: Run Data Pipeline
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
           GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
         run: python pipeline.py
