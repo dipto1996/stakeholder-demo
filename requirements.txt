@@ -1,12 +1,14 @@
-PyPDF2==3.0.1
-requests
-beautifulsoup4
-gspread
 google-api-python-client
 google-auth-httplib2
 oauth2client
-python-dotenv
-psycopg2-binary
-openai
 sentence-transformers
 pandas
+requests>=2.31.0
+beautifulsoup4>=4.12.2
+PyMuPDF>=1.23.1            # pip package name: pymupdf
+PyPDF2>=3.0.0
+openai>=1.0.0
+gspread>=5.7.0
+google-auth>=2.13.0
+psycopg2-binary>=2.9.6
+python-dotenv>=1.0.0
