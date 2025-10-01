@@ -1,36 +1,61 @@
-# pipeline.py — faster, direct ingestion to documents_pending and autopublish small items
+# pipeline_safe.py
+# Safe ingestion pipeline: non-destructive, schema-aware, per-row error tolerant.
+# Requirements: requests, beautifulsoup4, google-api-python-client, google-auth, gspread,
+#               psycopg2-binary, openai, PyPDF2, python-dotenv
+#
+# Env vars required:
+#   POSTGRES_URL
+#   GOOGLE_SHEET_ID
+#   OPENAI_API_KEY
+#   GOOGLE_APPLICATION_CREDENTIALS_JSON (service account JSON)
+# Optional:
+#   EMBEDDING_MODEL (default: text-embedding-3-small)
+#   MAX_PDF_DOWNLOAD_BYTES (default 50MB)
+#   PDF_AUTO_APPROVE_LIMIT_BYTES (default 2MB) -> small PDFs get auto-embedded/inserted
+#   CHUNK_CHARS (default 1200), CHUNK_OVERLAP (default 200)
+# Run: python pipeline_safe.py
+
 import os
-import re
 import json
 import time
-import gspread
-import requests
-import psycopg2
-import openai
 import hashlib
 import tempfile
+from urllib.parse import urlparse
+from io import BytesIO
+
+import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
+import psycopg2
+from PyPDF2 import PdfReader
+import openai
+import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from io import BytesIO
-from PyPDF2 import PdfReader
-from urllib.parse import urlparse
+from dotenv import load_dotenv
 
 load_dotenv()
 
+# -------------------- Config --------------------
 DATABASE_URL = os.getenv("POSTGRES_URL")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "16"))
-PDF_SIZE_AUTO_APPROVE_LIMIT = int(os.getenv("PDF_SIZE_AUTO_APPROVE_LIMIT_BYTES", str(20 * 1024 * 1024)))
-MAX_PDF_DOWNLOAD = int(os.getenv("MAX_PDF_DOWNLOAD_BYTES", str(50 * 1024 * 1024)))
+GOOGLE_SA_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 
-if not all([DATABASE_URL, GOOGLE_SHEET_ID, OPENAI_API_KEY]):
-    raise SystemExit("Missing required env vars: POSTGRES_URL, GOOGLE_SHEET_ID, OPENAI_API_KEY")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+MAX_PDF_DOWNLOAD_BYTES = int(os.getenv("MAX_PDF_DOWNLOAD_BYTES", str(50 * 1024 * 1024)))
+PDF_AUTO_APPROVE_LIMIT_BYTES = int(os.getenv("PDF_AUTO_APPROVE_LIMIT_BYTES", str(2 * 1024 * 1024)))
+CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "1200"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+EMBED_BATCH = int(os.getenv("EMBED_BATCH", "8"))
+
+if not all([DATABASE_URL, GOOGLE_SHEET_ID, OPENAI_API_KEY, GOOGLE_SA_JSON]):
+    raise SystemExit("Missing required env vars: POSTGRES_URL, GOOGLE_SHEET_ID, OPENAI_API_KEY, GOOGLE_APPLICATION_CREDENTIALS_JSON")
 
 openai.api_key = OPENAI_API_KEY
+
+# -------------------- Helpers --------------------
+def sha1(s):
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 def canonicalize_url(u):
     try:
@@ -41,20 +66,14 @@ def canonicalize_url(u):
     except:
         return u
 
-def domain_of_url(u):
+def domain_of(u):
     try:
         return urlparse(u).netloc.lower()
     except:
         return ""
 
-def safe_sha1(s):
-    return hashlib.sha1(s.encode('utf-8')).hexdigest()
-
 def get_google_creds():
-    creds_json_str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-    if not creds_json_str:
-        raise ValueError("GOOGLE_APPLICATION_CREDENTIALS_JSON secret not found in environment.")
-    creds_info = json.loads(creds_json_str)
+    creds_info = json.loads(GOOGLE_SA_JSON)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets.readonly",
         "https://www.googleapis.com/auth/drive",
@@ -62,8 +81,21 @@ def get_google_creds():
     ]
     return Credentials.from_service_account_info(creds_info, scopes=scopes)
 
-def download_pdf_to_temp(url, max_bytes=MAX_PDF_DOWNLOAD):
-    headers = {'User-Agent': 'Mozilla/5.0'}
+def chunk_text_chars(text, chunk_chars=CHUNK_CHARS, overlap=CHUNK_OVERLAP):
+    if not text:
+        return []
+    parts = []
+    i = 0
+    L = len(text)
+    while i < L:
+        part = text[i:i+chunk_chars].strip()
+        if part:
+            parts.append(part)
+        i += (chunk_chars - overlap)
+    return parts
+
+def download_pdf_temp(url, max_bytes=MAX_PDF_DOWNLOAD_BYTES):
+    headers = {"User-Agent": "Mozilla/5.0"}
     with requests.get(url, headers=headers, stream=True, timeout=60) as r:
         r.raise_for_status()
         total = 0
@@ -86,239 +118,277 @@ def download_pdf_to_temp(url, max_bytes=MAX_PDF_DOWNLOAD):
                 os.unlink(tmp.name)
             except:
                 pass
-            print("PDF download error:", e)
             return {"status": "error", "error": str(e)}
 
-def extract_text_from_pdf_path(path):
+def extract_pdf_text(path):
     try:
         reader = PdfReader(path)
-        text_parts = []
-        for page in reader.pages:
-            t = page.extract_text()
+        text_chunks = []
+        for p in reader.pages:
+            t = p.extract_text()
             if t:
-                text_parts.append(t)
-        return "\n".join(text_parts)
+                text_chunks.append(t)
+        return "\n".join(text_chunks)
     except Exception as e:
-        print("PDF parse error:", e)
+        print("pdf extract error:", e)
         return ""
 
 def scrape_url(url):
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, headers=headers, timeout=30)
         r.raise_for_status()
-        content_type = r.headers.get('Content-Type','')
-        if 'text/html' not in content_type:
+        ct = r.headers.get("Content-Type","")
+        if "text/html" not in ct:
             return None
-        soup = BeautifulSoup(r.text, 'html.parser')
-        title = soup.title.string.strip() if soup.title else "Untitled"
-        main_content = soup.select_one('article, div.main-content, div.content, div[role="main"]')
-        if main_content:
-            for element in main_content.select('nav, header, footer, script, style, .usa-alert, .footer'):
-                element.decompose()
-            text = main_content.get_text(separator='\n', strip=True)
+        soup = BeautifulSoup(r.text, "html.parser")
+        title = soup.title.string.strip() if soup.title and soup.title.string else url
+        main = soup.select_one("article, div.main-content, div#content, div.content, div[role='main']")
+        if main:
+            for el in main.select("nav, header, footer, script, style, .sidebar, .footer, .usa-alert"):
+                el.decompose()
+            text = main.get_text(separator="\n", strip=True)
         else:
-            text = soup.get_text(separator='\n', strip=True)
-        return {"title": title, "text": text, "size": len(r.content)}
+            text = soup.get_text(separator="\n", strip=True)
+        size = len(r.content)
+        return {"title": title, "text": text, "size": size}
     except Exception as e:
-        print("scrape_url failed:", e)
+        print("scrape error:", e)
         return None
 
 def read_google_doc(service, doc_id):
     try:
-        doc = service.documents().get(documentId=doc_id, fields='title,body').execute()
-        title = doc.get('title', 'Untitled Google Doc')
-        content = ""
-        for element in doc.get('body', {}).get('content', []):
-            if 'paragraph' in element:
-                for sub_element in element.get('paragraph').get('elements', []):
-                    if 'textRun' in sub_element:
-                        content += sub_element.get('textRun').get('content','')
-        return {"title": title, "text": content}
+        doc = service.documents().get(documentId=doc_id, fields="title,body").execute()
+        title = doc.get("title","Google Doc")
+        text = ""
+        for el in doc.get("body",{}).get("content",[]):
+            if "paragraph" in el:
+                for seg in el["paragraph"].get("elements",[]):
+                    if "textRun" in seg:
+                        text += seg["textRun"].get("content","")
+        return {"title": title, "text": text}
     except Exception as e:
-        print("read_google_doc failed:", e)
+        print("google doc read error:", e)
         return None
 
-def chunk_text_chars(text, chunk_chars=1200, overlap=200):
-    if not text:
-        return []
-    parts = []
-    i = 0
-    L = len(text)
-    while i < L:
-        part = text[i:i+chunk_chars].strip()
-        if part:
-            parts.append(part)
-        i += (chunk_chars - overlap)
-    return parts
+# -------------------- DB helpers --------------------
+def get_table_columns(conn, table_name):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = %s
+        """, (table_name,))
+        return [r[0] for r in cur.fetchall()]
 
-def create_embeddings_with_retry(batch, retries=3):
-    for attempt in range(retries):
+def insert_row_table(conn, table_name, row):
+    # Insert row dict into table by using only columns that exist.
+    cols = get_table_columns(conn, table_name)
+    use = [c for c in row.keys() if c in cols]
+    if not use:
+        return False
+    placeholders = ", ".join(["%s"] * len(use))
+    collist = ", ".join(use)
+    vals = [row[c] for c in use]
+    sql = f"INSERT INTO {table_name} ({collist}) VALUES ({placeholders}) ON CONFLICT DO NOTHING"
+    with conn.cursor() as cur:
+        cur.execute(sql, vals)
+    conn.commit()
+    return True
+
+def insert_documents_with_embedding(conn, row, embedding_vector):
+    # Insert into documents if embedding column exists (vector)
+    cols = get_table_columns(conn, "documents")
+    # required columns we will attempt:
+    wanted = {
+        "source_title": row.get("source_title"),
+        "source_url": row.get("source_url"),
+        "source_type": row.get("source_type"),
+        "content": row.get("chunk_text") or row.get("content"),
+        "chunk_hash": row.get("chunk_hash"),
+        # embedding: we will insert as text literal and cast to vector if possible
+        "scraped_at": row.get("scraped_at") or "now()",
+        "source_domain": row.get("source_domain")
+    }
+
+    # build insert column/list
+    insert_cols = [c for c in ["source_title","source_url","source_type","content","chunk_hash","embedding","scraped_at","source_domain"] if c in cols]
+    if "embedding" not in insert_cols:
+        # can't insert embedding if column not present
+        return False
+
+    # build values and SQL (embedding as literal string to cast)
+    collist = ", ".join(insert_cols)
+    placeholders = []
+    values = []
+    for c in insert_cols:
+        if c == "embedding":
+            placeholders.append("%s::vector")
+            values.append("[" + ",".join(map(str, embedding_vector)) + "]")
+        elif c == "scraped_at":
+            # prefer explicit timestamp if provided; else use now()
+            if wanted.get("scraped_at") and wanted.get("scraped_at") != "now()":
+                placeholders.append("%s")
+                values.append(wanted.get("scraped_at"))
+            else:
+                placeholders.append("now()")
+        else:
+            placeholders.append("%s")
+            values.append(wanted.get(c))
+    sql = f"INSERT INTO documents ({collist}) VALUES ({', '.join(placeholders)}) ON CONFLICT DO NOTHING"
+    with conn.cursor() as cur:
+        cur.execute(sql, values)
+    conn.commit()
+    return True
+
+# -------------------- Embedding helper --------------------
+def create_embeddings_batch(texts):
+    for attempt in range(3):
         try:
-            response = openai.embeddings.create(model=EMBEDDING_MODEL, input=batch)
-            return response
+            resp = openai.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+            return [d.embedding for d in resp.data]
         except Exception as e:
-            print("Embedding attempt failed:", e)
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
-                continue
-            raise
+            print("embeddings error:", e)
+            time.sleep(2 ** attempt)
+    raise RuntimeError("embedding failed after retries")
 
-def insert_pending(conn, rows):
-    with conn.cursor() as cur:
-        for r in rows:
-            try:
-                cur.execute("""
-                    INSERT INTO documents_pending
-                      (source_title, source_url, source_domain, source_type, chunk_text, chunk_hash, file_size_bytes, seed_origin, source_hash, status)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (source_url, chunk_hash) DO NOTHING
-                """, (
-                    r.get("source_title"), r.get("source_url"), r.get("source_domain"), r.get("source_type"),
-                    r.get("chunk"), r.get("chunk_hash"), r.get("file_size_bytes") or 0, r.get("seed_origin"), r.get("source_hash"), "pending"
-                ))
-            except Exception as e:
-                print("insert_pending error:", e)
-        conn.commit()
-
-def autopublish_small(conn, rows):
-    # For speed: create embeddings per-chunk and insert into documents
-    with conn.cursor() as cur:
-        for r in rows:
-            try:
-                text = r.get("chunk")
-                emb_resp = create_embeddings_with_retry([text])
-                embedding = emb_resp.data[0].embedding
-                vector_literal = '[' + ','.join(map(str, embedding)) + ']'
-                cur.execute("""
-                  INSERT INTO documents (source_title, source_url, source_type, content, chunk_hash, embedding, scraped_at, source_domain, source_hash, source_priority, status)
-                  VALUES (%s,%s,%s,%s,%s,%s::vector, now(), %s, %s, %s, 'approved')
-                  ON CONFLICT DO NOTHING
-                """, (
-                  r.get("source_title"), r.get("source_url"), r.get("source_type"), r.get("chunk"),
-                  r.get("chunk_hash"), vector_literal, r.get("source_domain"), r.get("source_hash"),
-                  r.get("source_priority") or 5
-                ))
-            except Exception as e:
-                print("autopublish error:", e)
-        conn.commit()
-
+# -------------------- Main pipeline --------------------
 def main():
-    print("=== Starting ingestion (fast mode) ===")
+    print("Starting safe ingestion pipeline...")
     creds = get_google_creds()
     gc = gspread.authorize(creds)
-    docs_service = build('docs','v1',credentials=creds)
+    docs_service = build("docs","v1",credentials=creds)
 
     sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
-    source_urls = sheet.col_values(1)[1:]
-    print("Found", len(source_urls), "rows.")
+    rows = sheet.col_values(1)[1:]
+    print("Found", len(rows), "URLs in sheet.")
 
     conn = psycopg2.connect(DATABASE_URL)
     try:
-        for url in source_urls:
-            if not url or url.strip()=="":
+        for url in rows:
+            if not url or not url.strip():
                 continue
-            url = canonicalize_url(url)
-            domain = domain_of_url(url)
-            print("\nProcessing:", url, "domain:", domain)
+            url = canonicalize_url(url.strip())
+            domain = domain_of(url)
+            print("Processing:", url)
 
-            content_data = None
-            source_type = "UNKNOWN"
+            # fetch/parse
+            content = None
+            source_type = "WEBPAGE"
             file_size = 0
-            source_hash = None
 
-            doc_match = re.search(r'/document/d/([a-zA-Z0-9-_]+)', url)
-            try:
-                if url.lower().endswith('.pdf'):
-                    source_type = "PDF"
-                    dl = download_pdf_to_temp(url, max_bytes=MAX_PDF_DOWNLOAD)
-                    if dl["status"] == "ok":
-                        file_size = dl["size"]
-                        text = extract_text_from_pdf_path(dl["path"])
-                        source_hash = safe_sha1(text[:100000]) if text else None
-                        content_data = {"title": url.split('/')[-1], "text": text}
-                        try:
-                            os.unlink(dl["path"])
-                        except:
-                            pass
-                    else:
-                        # If PDF too large or error: still create pending marker row and continue
-                        print("PDF large or error; creating single pending row for manual processing.")
-                        with conn.cursor() as cur:
-                            cur.execute("""
-                              INSERT INTO documents_pending (source_title, source_url, source_domain, source_type, file_size_bytes, status, notes)
-                              VALUES (%s,%s,%s,%s,%s,%s,%s)
-                              ON CONFLICT (source_url, chunk_hash) DO NOTHING
-                            """, (url.split('/')[-1], url, domain, "PDF", dl.get("size",0), "manual_review", "queued_large"))
-                            conn.commit()
-                        continue
-
-                elif doc_match:
-                    source_type = "GOOGLE_DOC"
-                    doc_id = doc_match.group(1)
-                    content_data = read_google_doc(docs_service, doc_id)
-                    file_size = len(content_data.get("text","")) if content_data else 0
-                    source_hash = safe_sha1(content_data.get("text","")[:100000]) if content_data and content_data.get("text") else None
-
+            if url.lower().endswith(".pdf"):
+                source_type = "PDF"
+                dl = download_pdf_temp(url)
+                if dl["status"] == "ok":
+                    file_size = dl["size"]
+                    text = extract_pdf_text(dl["path"])
+                    title = url.split("/")[-1] or "PDF"
+                    try:
+                        os.unlink(dl["path"])
+                    except:
+                        pass
+                    content = {"title": title, "text": text}
                 else:
-                    source_type = "WEBPAGE"
-                    scraped = scrape_url(url)
-                    if not scraped or not scraped.get("text"):
-                        print("No text extracted, skipping.")
-                        continue
-                    content_data = scraped
-                    file_size = scraped.get("size",0)
-                    source_hash = safe_sha1(scraped.get("text","")[:100000])
-            except Exception as e:
-                print("extract error:", e)
+                    # create a pending marker with status manual_review
+                    print("PDF too large or error; marking manual_review:", dl.get("status"))
+                    row = {
+                        "source_title": url.split("/")[-1] or url,
+                        "source_url": url,
+                        "source_domain": domain,
+                        "source_type": "PDF",
+                        "file_size_bytes": dl.get("size", 0),
+                        "status": "manual_review",
+                        "notes": "download_or_parse_issue"
+                    }
+                    try:
+                        insert_row_table(conn, "documents_pending", row)
+                    except Exception as e:
+                        print("failed to insert manual_review marker:", e)
+                    continue
+            else:
+                # google doc?
+                import re
+                m = re.search(r"/document/d/([a-zA-Z0-9-_]+)", url)
+                if m:
+                    source_type = "GOOGLE_DOC"
+                    doc_id = m.group(1)
+                    try:
+                        gd = read_google_doc(docs_service, doc_id)
+                        content = gd
+                        file_size = len(gd.get("text","")) if gd else 0
+                    except Exception as e:
+                        print("google doc read failed:", e)
+                        content = None
+                else:
+                    # webpage
+                    sc = scrape_url(url)
+                    if sc:
+                        content = sc
+                        file_size = sc.get("size", 0)
+                    else:
+                        content = None
+
+            if not content or not content.get("text") or len(content.get("text")) < 200:
+                print("No usable text (or too small), skipping.")
                 continue
 
-            if not content_data or not content_data.get("text"):
-                print("no content, skip")
-                continue
+            title = content.get("title") or url
+            text = content.get("text")
+            chunks = chunk_text_chars(text)
+            print("  chunks:", len(chunks))
 
-            title = content_data.get("title") or "Untitled"
-            text = content_data.get("text")
-            text = re.sub(r'\s+\n', '\n', text).strip()
-            if len(text) < 200:
-                print("content too short, skipping")
-                continue
-
-            chunks = chunk_text_chars(text, chunk_chars=1200, overlap=200)
-            print("chunks:", len(chunks))
-
+            # Prepare pending rows
             pending_rows = []
-            small_rows_for_autopublish = []
+            small_for_auto = []
             for c in chunks:
-                chash = safe_sha1(c[:10000])
-                row = {
+                chash = sha1(c[:2000])
+                r = {
                     "source_title": title,
                     "source_url": url,
                     "source_domain": domain,
                     "source_type": source_type,
-                    "chunk": c,
+                    "chunk_text": c,
                     "chunk_hash": chash,
                     "file_size_bytes": file_size,
-                    "seed_origin": "sheet_import",
-                    "source_hash": source_hash,
-                    "source_priority": 5
+                    "status": "auto_approved" if (file_size > 0 and file_size <= PDF_AUTO_APPROVE_LIMIT_BYTES and source_type!="PDF") else "pending",
+                    "seed_origin": "sheet_import"
                 }
-                pending_rows.append(row)
-                # autopublish heuristic: small file under limit, prefer webpages
-                if file_size <= PDF_SIZE_AUTO_APPROVE_LIMIT and source_type != "PDF":
-                    small_rows_for_autopublish.append(row)
+                pending_rows.append(r)
+                if r["status"] == "auto_approved":
+                    small_for_auto.append(r)
 
-            # Insert all into pending table
-            insert_pending(conn, pending_rows)
+            # Insert pending rows defensively
+            for pr in pending_rows:
+                try:
+                    insert_row_table(conn, "documents_pending", pr)
+                except Exception as e:
+                    print("insert pending row error:", e)
 
-            # Autopublish small rows (fast path) — this will create embeddings and insert into documents
-            if small_rows_for_autopublish:
-                autopublish_small(conn, small_rows_for_autopublish)
-
-        print("=== Ingestion run complete ===")
+            # For small rows, create embedding and insert into documents if possible
+            if small_for_auto:
+                # batch embeddings
+                texts = [r["chunk_text"] for r in small_for_auto]
+                try:
+                    embeddings = create_embeddings_batch(texts)
+                    for r, emb in zip(small_for_auto, embeddings):
+                        try:
+                            inserted = insert_documents_with_embedding(conn, r, emb)
+                            if not inserted:
+                                # if we couldn't insert into documents (no embedding col), ensure pending marked auto_approved
+                                try:
+                                    insert_row_table(conn, "documents_pending", r)
+                                except:
+                                    pass
+                        except Exception as ie:
+                            print("insert doc with emb error:", ie)
+                except Exception as ee:
+                    print("batch embedding failed:", ee)
+                    # ensure pending rows exist (they already were inserted)
 
     finally:
         conn.close()
+    print("Pipeline run complete.")
 
 if __name__ == "__main__":
     main()
