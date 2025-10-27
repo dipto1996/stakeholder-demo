@@ -1,5 +1,4 @@
 // pages/api/cred_check.js
-import fetch from "node-fetch";
 import cheerio from "cheerio";
 import stringSimilarity from "string-similarity";
 import { OpenAI } from "openai";
