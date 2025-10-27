@@ -14,12 +14,7 @@ import { getGeneralAnswer } from "../../lib/rag/fallback.js";
  */
 export const config = { runtime: "nodejs" };
 
-function okJSON(obj) {
-  return new Response(JSON.stringify(obj), { status: 200, headers: { "Content-Type": "application/json" } });
-}
-function badRequest(msg) {
-  return new Response(JSON.stringify({ error: msg }), { status: 400, headers: { "Content-Type": "application/json" } });
-}
+// Helper functions no longer needed - using res.json() directly
 
 function stripInlineLinks(text = "") {
   const urlRegex = /\bhttps?:\/\/[^\s)]+/gi;
@@ -95,21 +90,27 @@ const DEBUG = process.env.DEBUG_RAG === "1";
 const ENV_BYPASS = process.env.BYPASS_RAG === "1";
 const SKIP_URL_VERIFY = process.env.SKIP_URL_VERIFY === "1";
 
-export default async function handler(req) {
-  if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method Not Allowed" });
+  }
 
   try {
-    const body = await req.json();
-    const { messages } = body || {};
-    if (!Array.isArray(messages) || messages.length === 0) return badRequest("Invalid request body");
+    // Next.js API routes already parse the body
+    const { messages } = req.body || {};
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: "Invalid request body" });
+    }
 
     const userQuery = (messages[messages.length - 1].content || "").trim();
-    if (!userQuery) return badRequest("Empty user query");
+    if (!userQuery) {
+      return res.status(400).json({ error: "Empty user query" });
+    }
 
     const conversationHistory = (messages || []).slice(0, -1);
 
     // Determine bypass flag: request header overrides env for testing
-    const headerBypass = (req.headers && req.headers.get && req.headers.get("x-bypass-rag") === "1");
+    const headerBypass = req.headers["x-bypass-rag"] === "1";
     const BYPASS_RAG = headerBypass || ENV_BYPASS;
 
     // Greeting short-circuit
@@ -125,9 +126,9 @@ export default async function handler(req) {
           temperature: 0.2,
         });
         const greet = greetResp?.choices?.[0]?.message?.content?.trim() || "Hello! How can I help?";
-        return okJSON({ rag: { answer: greet, sources: [] }, fallback: null, path: "greet" });
+        return res.status(200).json({ rag: { answer: greet, sources: [] }, fallback: null, path: "greet" });
       } catch {
-        return okJSON({ rag: { answer: "Hello! How can I help?", sources: [] }, fallback: null, path: "greet" });
+        return res.status(200).json({ rag: { answer: "Hello! How can I help?", sources: [] }, fallback: null, path: "greet" });
       }
     }
 
@@ -215,14 +216,14 @@ Return ONLY the JSON object (no extra commentary).`;
           }
         } catch (llmErr) {
           console.error("LLM structured JSON call failed:", llmErr);
-          return okJSON({ answer: "Sorry — temporarily unable to fetch verified answer.", sources: [], path: "fallback" });
+          return res.status(200).json({ answer: "Sorry — temporarily unable to fetch verified answer.", sources: [], path: "fallback" });
         }
       }
 
       // 3) Call internal cred_check endpoint
       const baseUrl = process.env.VERCEL_URL
         ? `https://${process.env.VERCEL_URL}`
-        : `https://${req.headers.get("host") || "localhost:3000"}`;
+        : `https://${req.headers.host || "localhost:3000"}`;
       let credRes = null;
       try {
         const credResp = await fetch(`${baseUrl}/api/cred_check`, {
@@ -270,20 +271,20 @@ Return ONLY the JSON object (no extra commentary).`;
         if (DEBUG) {
           const debugPayload = { raw_gpt_json: gptJson, cred_raw: credRes, decision };
           if (decision === "verified")
-            return okJSON({ rag: { answer: gptJson.answer_text, sources }, fallback: null, path: "llm_cred_verified", _debug: debugPayload });
+            return res.status(200).json({ rag: { answer: gptJson.answer_text, sources }, fallback: null, path: "llm_cred_verified", _debug: debugPayload });
           if (decision === "probable")
-            return okJSON({ answer: `Partial verification: some claims could not be fully verified.\n\n${gptJson.answer_text}`, sources, path: "llm_cred_probable", _debug: debugPayload });
-          return okJSON({ answer: "We could not verify the claims in the LLM answer.", sources: [], path: "llm_cred_reject", _debug: debugPayload });
+            return res.status(200).json({ answer: `Partial verification: some claims could not be fully verified.\n\n${gptJson.answer_text}`, sources, path: "llm_cred_probable", _debug: debugPayload });
+          return res.status(200).json({ answer: "We could not verify the claims in the LLM answer.", sources: [], path: "llm_cred_reject", _debug: debugPayload });
         } else {
           if (decision === "verified")
-            return okJSON({ rag: { answer: gptJson.answer_text, sources }, fallback: null, path: "llm_cred_verified" });
+            return res.status(200).json({ rag: { answer: gptJson.answer_text, sources }, fallback: null, path: "llm_cred_verified" });
           if (decision === "probable")
-            return okJSON({ answer: `Partial verification: some claims could not be fully verified.\n\n${gptJson.answer_text}`, sources, path: "llm_cred_probable" });
-          return okJSON({ answer: "We could not verify the claims in the LLM answer.", sources: [], path: "llm_cred_reject" });
+            return res.status(200).json({ answer: `Partial verification: some claims could not be fully verified.\n\n${gptJson.answer_text}`, sources, path: "llm_cred_probable" });
+          return res.status(200).json({ answer: "We could not verify the claims in the LLM answer.", sources: [], path: "llm_cred_reject" });
         }
       }
 
-      return okJSON({ answer: "Temporary verification failure; please try again later.", sources: [], path: "cred_check_error" });
+      return res.status(200).json({ answer: "Temporary verification failure; please try again later.", sources: [], path: "cred_check_error" });
     } // end BYPASS_RAG
 
     /**************************************************************************
@@ -318,7 +319,7 @@ Return ONLY the JSON object (no extra commentary).`;
 
       const disclaimer = "Disclaimer: Based on general knowledge (not verified sources). Please consult official sources for legal decisions.\n\n";
       const replyText = cleanedText.toLowerCase().startsWith("disclaimer:") ? cleanedText : disclaimer + cleanedText;
-      return okJSON({ answer: replyText, sources, path: "fallback" });
+      return res.status(200).json({ answer: replyText, sources, path: "fallback" });
     }
 
     const candidates = candidateRows.map((r, i) => ({
@@ -351,7 +352,7 @@ Return ONLY the JSON object (no extra commentary).`;
       const sources = linkInfo.map((l, i) => ({ id: i + 1, title: l.url, url: l.url }));
       const disclaimer = "Disclaimer: Based on general knowledge (not verified sources). Please consult official sources for legal decisions.\n\n";
       const replyText = cleanedText.toLowerCase().startsWith("disclaimer:") ? cleanedText : disclaimer + cleanedText;
-      return okJSON({ answer: replyText, sources, path: "fallback" });
+      return res.status(200).json({ answer: replyText, sources, path: "fallback" });
     }
 
     const topDocs = reranked.map(d => ({
@@ -364,14 +365,14 @@ Return ONLY the JSON object (no extra commentary).`;
     catch {
       const fallback = await getGeneralAnswer(userQuery, conversationHistory).catch(() => ({ answer: "Sorry — couldn't fetch a general answer right now.", raw_urls: [] }));
       const { cleanedText } = stripInlineLinks(fallback.answer || "");
-      return okJSON({ answer: cleanedText, sources: [], path: "fallback" });
+      return res.status(200).json({ answer: cleanedText, sources: [], path: "fallback" });
     }
 
     const synthText = final?.answer || "";
     if (synthesisHasMissingMarkers(synthText)) {
       const fallback = await getGeneralAnswer(userQuery, conversationHistory).catch(() => ({ answer: "Sorry — couldn't fetch a general answer right now.", raw_urls: [] }));
       const { cleanedText } = stripInlineLinks(fallback.answer || "");
-      return okJSON({ answer: cleanedText, sources: [], path: "fallback" });
+      return res.status(200).json({ answer: cleanedText, sources: [], path: "fallback" });
     }
 
     const rag_sources = final?.sources?.length
@@ -383,12 +384,9 @@ Return ONLY the JSON object (no extra commentary).`;
           excerpt: d.content?.slice(0, 400)
         }));
 
-    return okJSON({ rag: { answer: final.answer, sources: rag_sources }, fallback: null, path: "rag" });
+    return res.status(200).json({ rag: { answer: final.answer, sources: rag_sources }, fallback: null, path: "rag" });
   } catch (err) {
     console.error("chat api error:", err);
-    return new Response(JSON.stringify({ error: err?.message || "Internal Server Error" }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
+    return res.status(500).json({ error: err?.message || "Internal Server Error" });
   }
 }
