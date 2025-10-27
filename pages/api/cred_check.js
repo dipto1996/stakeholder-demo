@@ -42,19 +42,7 @@ const AUTHORITATIVE_DOMAINS = [
   "cbp.gov",
 ];
 
-function okJSON(obj) {
-  return new Response(JSON.stringify(obj), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-function badRequest(msg) {
-  return new Response(JSON.stringify({ error: msg }), {
-    status: 400,
-    headers: { "Content-Type": "application/json" },
-  });
-}
+// Helper functions no longer needed - using res.json() directly
 
 /**
  * Check if URL is from an authoritative domain
@@ -141,21 +129,21 @@ function scoreClaimCredibility(claim, citations) {
 /**
  * Main handler
  */
-export default async function handler(req) {
-  if (req.method !== "POST")
-    return new Response("Method Not Allowed", { status: 405 });
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method Not Allowed" });
+  }
 
   try {
-    const body = await req.json();
-    const { answer_text, claims, citations } = body || {};
+    const { answer_text, claims, citations } = req.body || {};
 
     // Validate input
     if (!claims || !Array.isArray(claims) || claims.length === 0) {
-      return badRequest("Invalid request: claims array required");
+      return res.status(400).json({ error: "Invalid request: claims array required" });
     }
 
     if (!citations || !Array.isArray(citations)) {
-      return badRequest("Invalid request: citations array required");
+      return res.status(400).json({ error: "Invalid request: citations array required" });
     }
 
     // Score each claim
@@ -216,15 +204,9 @@ export default async function handler(req) {
       },
     };
 
-    return okJSON({ ok: true, result });
+    return res.status(200).json({ ok: true, result });
   } catch (err) {
     console.error("cred_check error:", err);
-    return new Response(
-      JSON.stringify({ error: err?.message || "Internal Server Error" }),
-      {
-        status: 500,
-        headers: { "Content-Type": "application/json" },
-      }
-    );
+    return res.status(500).json({ error: err?.message || "Internal Server Error" });
   }
 }
