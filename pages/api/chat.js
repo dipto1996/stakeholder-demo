@@ -7,6 +7,7 @@ import { rerankCandidates } from "../../lib/rag/reranker.js";
 import { isConfident } from "../../lib/rag/confidence.js";
 import { synthesizeRAGAnswer } from "../../lib/rag/synthesizer.js";
 import { getGeneralAnswer } from "../../lib/rag/fallback.js";
+import { runCredCheck } from "../../lib/cred_check_runner.js";
 
 /**
  * Use Node runtime so process.env is available (Edge runtime does not expose env the same way).
@@ -220,34 +221,18 @@ Return ONLY the JSON object (no extra commentary).`;
         }
       }
 
-      // 3) Call internal cred_check endpoint
-      const baseUrl = process.env.VERCEL_URL
-        ? `https://${process.env.VERCEL_URL}`
-        : `https://${req.headers.host || "localhost:3000"}`;
+      // 3) Call cred_check directly (no HTTP, avoids Vercel auth issues)
       let credRes = null;
       try {
-        console.log("[DEBUG] Calling cred_check at:", `${baseUrl}/api/cred_check`);
-        console.log("[DEBUG] Payload:", JSON.stringify(gptJson).slice(0, 200));
+        console.log("[DEBUG] Calling runCredCheck directly with payload:", JSON.stringify(gptJson).slice(0, 200));
         
-        const credResp = await fetch(`${baseUrl}/api/cred_check`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(gptJson),
-        });
+        // Direct function call - no network request, no 401 issues!
+        credRes = await runCredCheck(gptJson);
         
-        console.log("[DEBUG] cred_check response status:", credResp.status);
-        console.log("[DEBUG] cred_check response headers:", Object.fromEntries(credResp.headers.entries()));
-        
-        if (!credResp.ok) {
-          const errorText = await credResp.text();
-          console.error("[ERROR] cred_check returned non-OK status:", credResp.status, errorText.slice(0, 500));
-          throw new Error(`cred_check returned ${credResp.status}`);
-        }
-        
-        credRes = await credResp.json();
-        console.log("[DEBUG] cred_check result:", JSON.stringify(credRes).slice(0, 200));
+        console.log("[DEBUG] runCredCheck result ok:", credRes?.ok, "decision:", credRes?.result?.decision);
       } catch (cErr) {
-        console.warn("cred_check call failed:", cErr?.message || cErr);
+        console.warn("runCredCheck call failed:", cErr?.message || cErr);
+        credRes = { ok: false, error: cErr?.message || "runner_error" };
       }
 
       // 4) Interpret cred-check result
