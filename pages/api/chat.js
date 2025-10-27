@@ -176,13 +176,28 @@ export default async function handler(req, res) {
       // 2) Force LLM to produce structured JSON if helper didn't
       if (!gptJson || !Array.isArray(gptJson.claims)) {
         try {
-          const superPrompt = `You are a legal-information assistant. Answer using ONLY authoritative U.S. sources and produce valid JSON exactly in this format:
+          const currentYear = new Date().getFullYear();
+          const currentDate = new Date().toISOString().split('T')[0];
+          
+          const superPrompt = `You are a legal-information assistant. Today is ${currentDate} (${currentYear}).
+
+CRITICAL RULES:
+1. If asked about recent events, proclamations, or policies, you MUST state if you don't have current information
+2. Always include the year/date when discussing policies or proclamations
+3. If your knowledge is outdated, clearly state your knowledge cutoff date
+4. NEVER make up recent information - only cite what you can verify with authoritative sources
+
+Answer using ONLY authoritative U.S. sources and produce valid JSON exactly in this format:
 {
-  "answer_text":"<full answer>",
+  "answer_text":"<full answer with dates/years>",
   "claims":[{"id":"c1","text":"..."}],
   "citations":[{"claim_id":"c1","urls":[{"url":"https://...","quoted_snippet":"..."}]}]
 }
+
 For each factual sentence include at least one primary-source citation when possible (uscis.gov, dol.gov, state.gov, justice.gov, eoir.justice.gov, ecfr.gov, federalregister.gov, uscourts.gov, courtlistener.com, congress.gov, law.cornell.edu).
+
+If you don't have current information about recent events (${currentYear}), say so explicitly in the answer_text.
+
 Return ONLY the JSON object (no extra commentary).`;
 
           const resp = await openai.chat.completions.create({
