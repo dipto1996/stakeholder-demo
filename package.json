@@ -9,18 +9,19 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "ai": "^3.0.0",
-    "next": "14.2.4",
-    "openai": "^4.52.0",
-    "@vercel/postgres": "^0.9.0",
-    "react": "^18",
-    "react-dom": "^18",
-    "next-auth": "^4.24.6",
-    "bcryptjs": "^2.4.3",
     "@aws-sdk/client-s3": "^3.476.0",
     "@aws-sdk/s3-request-presigner": "^3.476.0",
+    "@vercel/postgres": "^0.9.0",
+    "ai": "^3.0.0",
+    "bcryptjs": "^2.4.3",
     "cheerio": "^1.0.0-rc.12",
-    "string-similarity": "^4.0.4"
+    "next": "14.2.4",
+    "next-auth": "^4.24.6",
+    "openai": "^4.52.0",
+    "react": "^18",
+    "react-dom": "^18",
+    "string-similarity": "^4.0.4",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "autoprefixer": "^10.4.19",

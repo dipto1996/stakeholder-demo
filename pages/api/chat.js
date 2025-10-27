@@ -86,12 +86,14 @@ function synthesisHasMissingMarkers(text) {
  * DEBUG / FEATURE FLAGS
  * - DEBUG_RAG=1 → include debug payload
  * - BYPASS_RAG=1 → skip RAG and run LLM + cred_check
+ * - SKIP_URL_VERIFY=1 → skip URL verification (faster response)
  *
  * Request header override for easy testing:
  * - x-bypass-rag: "1" => bypass regardless of env
  */
 const DEBUG = process.env.DEBUG_RAG === "1";
 const ENV_BYPASS = process.env.BYPASS_RAG === "1";
+const SKIP_URL_VERIFY = process.env.SKIP_URL_VERIFY === "1";
 
 export default async function handler(req) {
   if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
@@ -129,17 +131,22 @@ export default async function handler(req) {
       }
     }
 
-    // 1) Router
+    // 1) Router - Skip for simple queries to save time
     let refined_query = userQuery;
     let intent = "question";
     let format = "paragraph";
-    try {
-      const r = await routeQuery(userQuery, conversationHistory);
-      refined_query = r.refined_query || refined_query;
-      intent = r.intent || intent;
-      format = r.format || format;
-    } catch (rerr) {
-      console.warn("routeQuery failed:", rerr?.message || rerr);
+    
+    // Skip router for short queries (performance optimization)
+    const shouldRoute = userQuery.split(/\s+/).length > 5;
+    if (shouldRoute) {
+      try {
+        const r = await routeQuery(userQuery, conversationHistory);
+        refined_query = r.refined_query || refined_query;
+        intent = r.intent || intent;
+        format = r.format || format;
+      } catch (rerr) {
+        console.warn("routeQuery failed:", rerr?.message || rerr);
+      }
     }
 
     /**************************************************************************
@@ -297,7 +304,13 @@ Return ONLY the JSON object (no extra commentary).`;
       const { cleanedText, urlsInText } = stripInlineLinks(fallback.answer || "");
       const rawUrls = (fallback.raw_urls && fallback.raw_urls.length) ? fallback.raw_urls : urlsInText;
       let linkInfo = [];
-      try { linkInfo = await verifyUrls(rawUrls, { maxUrls: 6, perUrlTimeout: 2000 }); } catch { linkInfo = (rawUrls || []).slice(0, 6).map(u => ({ url: u, ok: null, status: null })); }
+      
+      // Skip URL verification if flag is set (performance optimization)
+      if (!SKIP_URL_VERIFY) {
+        try { linkInfo = await verifyUrls(rawUrls, { maxUrls: 4, perUrlTimeout: 1500 }); } catch { linkInfo = (rawUrls || []).slice(0, 4).map(u => ({ url: u, ok: null, status: null })); }
+      } else {
+        linkInfo = (rawUrls || []).slice(0, 6).map(u => ({ url: u, ok: null, status: null }));
+      }
 
       const sources = (linkInfo && linkInfo.length)
         ? linkInfo.map((l, i) => ({ id: i + 1, title: l.url, url: l.url, ok: l.ok, status: l.status }))
@@ -327,7 +340,14 @@ Return ONLY the JSON object (no extra commentary).`;
       const { cleanedText, urlsInText } = stripInlineLinks(fallback.answer || "");
       const rawUrls = (fallback.raw_urls && fallback.raw_urls.length) ? fallback.raw_urls : urlsInText;
       let linkInfo = [];
-      try { linkInfo = await verifyUrls(rawUrls, { maxUrls: 6, perUrlTimeout: 2000 }); } catch { linkInfo = (rawUrls || []).slice(0, 6).map(u => ({ url: u, ok: null, status: null })); }
+      
+      // Skip URL verification if flag is set (performance optimization)
+      if (!SKIP_URL_VERIFY) {
+        try { linkInfo = await verifyUrls(rawUrls, { maxUrls: 4, perUrlTimeout: 1500 }); } catch { linkInfo = (rawUrls || []).slice(0, 4).map(u => ({ url: u, ok: null, status: null })); }
+      } else {
+        linkInfo = (rawUrls || []).slice(0, 6).map(u => ({ url: u, ok: null, status: null }));
+      }
+      
       const sources = linkInfo.map((l, i) => ({ id: i + 1, title: l.url, url: l.url }));
       const disclaimer = "Disclaimer: Based on general knowledge (not verified sources). Please consult official sources for legal decisions.\n\n";
       const replyText = cleanedText.toLowerCase().startsWith("disclaimer:") ? cleanedText : disclaimer + cleanedText;
