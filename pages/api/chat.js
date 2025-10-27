@@ -73,6 +73,19 @@ function synthesisHasMissingMarkers(text) {
   return markers.some(m => low.includes(m));
 }
 
+/**
+ * ===========================
+ *  DEBUG / FEATURE FLAGS
+ * ===========================
+ *
+ * - DEBUG_RAG (set to "1" to include debug payloads in responses)
+ * - BYPASS_RAG (set to "1" to skip retrieve->rerank->synthesize and instead run LLM->cred_check)
+ *
+ * Note: BYPASS_RAG is safe toggle for short-term tests. When unset (default) the original RAG flow runs.
+ */
+const DEBUG = process.env.DEBUG_RAG === "1";
+const BYPASS_RAG = process.env.BYPASS_RAG === "1";
+
 export default async function handler(req) {
   if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
 
@@ -117,6 +130,142 @@ export default async function handler(req) {
     } catch (rerr) {
       console.warn("routeQuery failed:", rerr?.message || rerr);
     }
+
+    /**************************************************************************
+     * BYPASS_RAG PATH
+     *
+     * If BYPASS_RAG=1, skip retrieve->rerank->synthesize and instead:
+     *  - call LLM with a super-prompt to produce structured JSON
+     *  - POST JSON to /api/cred_check
+     *  - return cred-checked results to client
+     *
+     * The original RAG logic below is unchanged and will run when BYPASS_RAG is not set.
+     **************************************************************************/
+    if (BYPASS_RAG) {
+      console.log("RAG BYPASS enabled. Using LLM + cred-check pipeline.");
+
+      // --- 1: Try to get structured JSON from existing helper (if available) ---
+      let gptJson = null;
+      try {
+        if (typeof getGeneralAnswer === "function") {
+          // If getGeneralAnswer supports a structured flag, prefer that (non-blocking)
+          try {
+            gptJson = await getGeneralAnswer(userQuery, conversationHistory, { structured: true });
+          } catch (eStructured) {
+            // ignore and fall back to direct LLM call
+            console.warn("getGeneralAnswer(structured) failed:", eStructured?.message || eStructured);
+            gptJson = null;
+          }
+        }
+      } catch (e) {
+        console.warn("Attempt to call getGeneralAnswer failed:", e?.message || e);
+        gptJson = null;
+      }
+
+      // --- 2: If no structured JSON, force the LLM to produce it ---
+      if (!gptJson || !Array.isArray(gptJson.claims)) {
+        try {
+          const superPrompt = `You are a legal-information assistant. Answer using ONLY authoritative US sources and produce a JSON exactly in this format:
+{
+  "answer_text":"<full answer>",
+  "claims":[{"id":"c1","text":"..."}],
+  "citations":[{"claim_id":"c1","urls":[{"url":"https://...","quoted_snippet":"..."}]}]
+}
+For each factual sentence include at least one primary-source citation when possible (uscis.gov, dol.gov, state.gov, justice.gov, eoir.justice.gov, ecfr.gov, federalregister.gov, uscourts.gov, courtlistener.com, congress.gov, law.cornell.edu).
+If you cannot find a primary-source citation for a claim, still include the claim and set cited URL(s) to an empty list. Return only valid JSON object (no commentary).`;
+
+          const resp = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+              { role: "system", content: superPrompt },
+              { role: "user", content: userQuery }
+            ],
+            max_tokens: 1200,
+            temperature: 0.0,
+          });
+
+          const raw = resp?.choices?.[0]?.message?.content || "{}";
+          const m = raw.match(/\{[\s\S]*\}/);
+          if (m) {
+            try {
+              gptJson = JSON.parse(m[0]);
+            } catch (parseErr) {
+              console.warn("Failed to parse JSON from LLM response; falling back to text-wrapped claim", parseErr?.message || parseErr);
+              gptJson = {
+                answer_text: raw,
+                claims: [{ id: "c1", text: raw.slice(0, 400) }],
+                citations: []
+              };
+            }
+          } else {
+            // fallback: wrap the raw text as single claim
+            gptJson = {
+              answer_text: raw,
+              claims: [{ id: "c1", text: raw.slice(0, 400) }],
+              citations: []
+            };
+          }
+        } catch (llmErr) {
+          console.error("LLM structured JSON call failed:", llmErr);
+          return okJSON({ answer: "Sorry — temporarily unable to fetch verified answer. Please try again later.", sources: [], path: "fallback" });
+        }
+      }
+
+      // --- 3: Call the internal cred_check endpoint (serverless) ---
+      // Resolve base URL for serverless invocation. Vercel provides VERCEL_URL in env during runtime.
+      const baseUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : `https://${req.headers.get("host") || "localhost:3000"}`;
+      let credRes = null;
+      try {
+        const credResp = await fetch(`${baseUrl}/api/cred_check`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(gptJson),
+        });
+        credRes = await credResp.json();
+      } catch (cErr) {
+        console.warn("cred_check call failed:", cErr?.message || cErr);
+        credRes = null;
+      }
+
+      // --- 4: Interpret cred-check result and return appropriate response ---
+      // Expected shapes: { ok:true, result: { overall_score, decision, results: [...] } } OR direct { overall, overallDecision, results }
+      let outcome = null;
+      if (credRes && credRes.result) outcome = credRes.result;
+      else if (credRes && credRes.ok && credRes.result) outcome = credRes.result;
+      else if (credRes && (credRes.overall || credRes.overallDecision || credRes.results)) outcome = credRes;
+      else outcome = null;
+
+      if (outcome) {
+        const decision = outcome.decision || outcome.overallDecision || (typeof outcome.overall_score === "number" ? (outcome.overall_score >= 0.85 ? "verified" : (outcome.overall_score >= 0.6 ? "probable" : "reject")) : (typeof outcome.overall === "number" ? (outcome.overall >= 0.85 ? "verified" : (outcome.overall >= 0.6 ? "probable" : "reject")) : "reject")));
+
+        // gather simple sources list (dedup URLs)
+        const gatherSources = (outcome.results || []).flatMap(r => (r.evidence || []).map(e => e.url).filter(Boolean));
+        const sources = Array.from(new Set(gatherSources)).slice(0, 6).map((u, i) => ({ id: i + 1, title: u, url: u }));
+
+        if (DEBUG) {
+          // include debug payload to help troubleshooting (only when DEBUG_RAG=1)
+          const debugPayload = { raw_gpt_json: gptJson, cred_raw: credRes, decision };
+          if (decision === "verified") return okJSON({ rag: { answer: gptJson.answer_text, sources }, fallback: null, path: "llm_cred_verified", _debug: debugPayload });
+          if (decision === "probable") return okJSON({ answer: `Partial verification: some claims could not be fully verified.\n\n${gptJson.answer_text}`, sources, path: "llm_cred_probable", _debug: debugPayload });
+          return okJSON({ answer: "We could not verify the claims in the LLM answer. A human review is required.", sources: [], path: "llm_cred_reject", _debug: debugPayload });
+        } else {
+          if (decision === "verified") return okJSON({ rag: { answer: gptJson.answer_text, sources }, fallback: null, path: "llm_cred_verified" });
+          if (decision === "probable") return okJSON({ answer: `Partial verification: some claims could not be fully verified.\n\n${gptJson.answer_text}`, sources, path: "llm_cred_probable" });
+          return okJSON({ answer: "We could not verify the claims in the LLM answer. A human review is required.", sources: [], path: "llm_cred_reject" });
+        }
+      } else {
+        // cred_check failed or returned unexpected format
+        return okJSON({ answer: "Temporary verification failure; please try again or contact support.", sources: [], path: "cred_check_error" });
+      }
+    } // end BYPASS_RAG
+
+    /**************************************************************************
+     * ORIGINAL RAG FLOW
+     *
+     * If BYPASS_RAG is not enabled, the code continues with the existing
+     * retrieve -> rerank -> isConfident -> synthesize -> post-synthesis checks.
+     * This block is unchanged from your original file.
+     **************************************************************************/
 
     // 2) Retrieval
     let candidateRows = [];
