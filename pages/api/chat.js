@@ -226,12 +226,26 @@ Return ONLY the JSON object (no extra commentary).`;
         : `https://${req.headers.host || "localhost:3000"}`;
       let credRes = null;
       try {
+        console.log("[DEBUG] Calling cred_check at:", `${baseUrl}/api/cred_check`);
+        console.log("[DEBUG] Payload:", JSON.stringify(gptJson).slice(0, 200));
+        
         const credResp = await fetch(`${baseUrl}/api/cred_check`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(gptJson),
         });
+        
+        console.log("[DEBUG] cred_check response status:", credResp.status);
+        console.log("[DEBUG] cred_check response headers:", Object.fromEntries(credResp.headers.entries()));
+        
+        if (!credResp.ok) {
+          const errorText = await credResp.text();
+          console.error("[ERROR] cred_check returned non-OK status:", credResp.status, errorText.slice(0, 500));
+          throw new Error(`cred_check returned ${credResp.status}`);
+        }
+        
         credRes = await credResp.json();
+        console.log("[DEBUG] cred_check result:", JSON.stringify(credRes).slice(0, 200));
       } catch (cErr) {
         console.warn("cred_check call failed:", cErr?.message || cErr);
       }
