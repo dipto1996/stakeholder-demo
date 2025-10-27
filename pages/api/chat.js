@@ -8,7 +8,11 @@ import { isConfident } from "../../lib/rag/confidence.js";
 import { synthesizeRAGAnswer } from "../../lib/rag/synthesizer.js";
 import { getGeneralAnswer } from "../../lib/rag/fallback.js";
 
-export const config = { runtime: "edge" };
+/**
+ * Use Node runtime so process.env is available (Edge runtime does not expose env the same way).
+ * If you previously had `{ runtime: "edge" }`, replace it with the line below.
+ */
+export const config = { runtime: "nodejs" };
 
 function okJSON(obj) {
   return new Response(JSON.stringify(obj), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -79,14 +83,15 @@ function synthesisHasMissingMarkers(text) {
 }
 
 /**
- * ===========================
- *  DEBUG / FEATURE FLAGS
- * ===========================
- * - DEBUG_RAG=1 → adds debug payloads in responses
- * - BYPASS_RAG=1 → skips RAG and runs LLM + cred_check instead
+ * DEBUG / FEATURE FLAGS
+ * - DEBUG_RAG=1 → include debug payload
+ * - BYPASS_RAG=1 → skip RAG and run LLM + cred_check
+ *
+ * Request header override for easy testing:
+ * - x-bypass-rag: "1" => bypass regardless of env
  */
 const DEBUG = process.env.DEBUG_RAG === "1";
-const BYPASS_RAG = process.env.BYPASS_RAG === "1";
+const ENV_BYPASS = process.env.BYPASS_RAG === "1";
 
 export default async function handler(req) {
   if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
@@ -100,6 +105,10 @@ export default async function handler(req) {
     if (!userQuery) return badRequest("Empty user query");
 
     const conversationHistory = (messages || []).slice(0, -1);
+
+    // Determine bypass flag: request header overrides env for testing
+    const headerBypass = (req.headers && req.headers.get && req.headers.get("x-bypass-rag") === "1");
+    const BYPASS_RAG = headerBypass || ENV_BYPASS;
 
     // Greeting short-circuit
     if (/^(hi|hello|hey|good (morning|afternoon|evening))\b/i.test(userQuery) && userQuery.split(/\s+/).length <= 4) {
@@ -134,28 +143,39 @@ export default async function handler(req) {
     }
 
     /**************************************************************************
-     * BYPASS_RAG PATH
+     * BYPASS_RAG PATH (LLM -> cred_check)
      **************************************************************************/
     if (BYPASS_RAG) {
       console.log("BYPASS_RAG enabled → Using LLM + cred-check pipeline.");
 
+      // 1) Try to get structured JSON from helper (if available)
       let gptJson = null;
       try {
         if (typeof getGeneralAnswer === "function") {
-          gptJson = await getGeneralAnswer(userQuery, conversationHistory, { structured: true });
+          try {
+            gptJson = await getGeneralAnswer(userQuery, conversationHistory, { structured: true });
+          } catch (eStructured) {
+            console.warn("getGeneralAnswer(structured) failed:", eStructured?.message || eStructured);
+            gptJson = null;
+          }
         }
       } catch (e) {
-        console.warn("getGeneralAnswer(structured) failed:", e?.message || e);
+        console.warn("Attempt to call getGeneralAnswer failed:", e?.message || e);
+        gptJson = null;
       }
 
+      // 2) Force LLM to produce structured JSON if helper didn't
       if (!gptJson || !Array.isArray(gptJson.claims)) {
         try {
-          const superPrompt = `You are a legal-information assistant. Answer using ONLY authoritative US sources and produce valid JSON exactly as:
+          const superPrompt = `You are a legal-information assistant. Answer using ONLY authoritative U.S. sources and produce valid JSON exactly in this format:
 {
   "answer_text":"<full answer>",
   "claims":[{"id":"c1","text":"..."}],
   "citations":[{"claim_id":"c1","urls":[{"url":"https://...","quoted_snippet":"..."}]}]
-}`;
+}
+For each factual sentence include at least one primary-source citation when possible (uscis.gov, dol.gov, state.gov, justice.gov, eoir.justice.gov, ecfr.gov, federalregister.gov, uscourts.gov, courtlistener.com, congress.gov, law.cornell.edu).
+Return ONLY the JSON object (no extra commentary).`;
+
           const resp = await openai.chat.completions.create({
             model: "gpt-4o-mini",
             messages: [
@@ -165,20 +185,34 @@ export default async function handler(req) {
             max_tokens: 1200,
             temperature: 0.0,
           });
+
           const raw = resp?.choices?.[0]?.message?.content || "{}";
           const m = raw.match(/\{[\s\S]*\}/);
-          gptJson = m ? JSON.parse(m[0]) : {
-            answer_text: raw,
-            claims: [{ id: "c1", text: raw.slice(0, 300) }],
-            citations: []
-          };
-        } catch (err) {
-          console.error("LLM structured JSON call failed:", err);
+          if (m) {
+            try {
+              gptJson = JSON.parse(m[0]);
+            } catch (parseErr) {
+              console.warn("Failed to parse JSON from LLM response; wrapping as single claim", parseErr?.message || parseErr);
+              gptJson = {
+                answer_text: raw,
+                claims: [{ id: "c1", text: raw.slice(0, 400) }],
+                citations: []
+              };
+            }
+          } else {
+            gptJson = {
+              answer_text: raw,
+              claims: [{ id: "c1", text: raw.slice(0, 400) }],
+              citations: []
+            };
+          }
+        } catch (llmErr) {
+          console.error("LLM structured JSON call failed:", llmErr);
           return okJSON({ answer: "Sorry — temporarily unable to fetch verified answer.", sources: [], path: "fallback" });
         }
       }
 
-      // --- Call cred_check API ---
+      // 3) Call internal cred_check endpoint
       const baseUrl = process.env.VERCEL_URL
         ? `https://${process.env.VERCEL_URL}`
         : `https://${req.headers.get("host") || "localhost:3000"}`;
@@ -194,13 +228,13 @@ export default async function handler(req) {
         console.warn("cred_check call failed:", cErr?.message || cErr);
       }
 
+      // 4) Interpret cred-check result
       let outcome = null;
       if (credRes?.result) outcome = credRes.result;
       else if (credRes?.ok && credRes.result) outcome = credRes.result;
       else if (credRes?.overall || credRes?.overallDecision || credRes?.results) outcome = credRes;
 
       if (outcome) {
-        // --- fixed syntax here ---
         const decision =
           outcome.decision ||
           outcome.overallDecision ||
@@ -243,7 +277,7 @@ export default async function handler(req) {
       }
 
       return okJSON({ answer: "Temporary verification failure; please try again later.", sources: [], path: "cred_check_error" });
-    }
+    } // end BYPASS_RAG
 
     /**************************************************************************
      * ORIGINAL RAG FLOW (unchanged)
