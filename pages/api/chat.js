@@ -245,6 +245,8 @@ Return ONLY the JSON object (no extra commentary).`;
         credRes = await runCredCheck(gptJson);
         
         console.log("[DEBUG] runCredCheck result ok:", credRes?.ok, "decision:", credRes?.result?.decision);
+        console.log("[DEBUG] Overall score:", credRes?.result?.overall_score);
+        console.log("[DEBUG] Authoritative citations:", credRes?.result?.summary?.authoritative_citations, "/ Total:", credRes?.result?.summary?.total_citations);
       } catch (cErr) {
         console.warn("runCredCheck call failed:", cErr?.message || cErr);
         credRes = { ok: false, error: cErr?.message || "runner_error" };
@@ -288,13 +290,17 @@ Return ONLY the JSON object (no extra commentary).`;
             return res.status(200).json({ rag: { answer: gptJson.answer_text, sources }, fallback: null, path: "llm_cred_verified", _debug: debugPayload });
           if (decision === "probable")
             return res.status(200).json({ answer: `Partial verification: some claims could not be fully verified.\n\n${gptJson.answer_text}`, sources, path: "llm_cred_probable", _debug: debugPayload });
-          return res.status(200).json({ answer: "We could not verify the claims in the LLM answer.", sources: [], path: "llm_cred_reject", _debug: debugPayload });
+          // Show answer even if rejected, with disclaimer
+          const rejectDisclaimer = "⚠️ Warning: We could not verify the claims in this answer against authoritative sources. This information may be incomplete or outdated. Please verify with official sources.\n\n";
+          return res.status(200).json({ answer: rejectDisclaimer + gptJson.answer_text, sources, path: "llm_cred_reject", _debug: debugPayload });
         } else {
           if (decision === "verified")
             return res.status(200).json({ rag: { answer: gptJson.answer_text, sources }, fallback: null, path: "llm_cred_verified" });
           if (decision === "probable")
             return res.status(200).json({ answer: `Partial verification: some claims could not be fully verified.\n\n${gptJson.answer_text}`, sources, path: "llm_cred_probable" });
-          return res.status(200).json({ answer: "We could not verify the claims in the LLM answer.", sources: [], path: "llm_cred_reject" });
+          // Show answer even if rejected, with disclaimer
+          const rejectDisclaimer = "⚠️ Warning: We could not verify the claims in this answer against authoritative sources. This information may be incomplete or outdated. Please verify with official sources.\n\n";
+          return res.status(200).json({ answer: rejectDisclaimer + gptJson.answer_text, sources, path: "llm_cred_reject" });
         }
       }
 
