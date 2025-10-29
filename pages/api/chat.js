@@ -65,12 +65,18 @@ async function verifyUrls(urls = [], { maxUrls = 6, perUrlTimeout = 2000 } = {})
 
 function synthesisHasMissingMarkers(text) {
   if (!text) return true;
-  const low = text.toLowerCase();
-  const markers = [
-    "not in sources","not in the sources","not present in the sources","i could not find",
-    "no supporting source","no evidence in the sources","not found in the sources","no documentation found"
+  // Only trigger fallback if the ENTIRE response is a refusal (very short + contains refusal phrase)
+  const low = text.toLowerCase().trim();
+  if (low.length > 200) return false; // If answer is substantial, it's probably good
+  
+  // Check for complete refusals only
+  const refusalMarkers = [
+    "this information is not available in the provided sources",
+    "i could not find this information",
+    "no information found in sources",
+    "unable to find in the provided sources"
   ];
-  return markers.some(m => low.includes(m));
+  return refusalMarkers.some(m => low.includes(m));
 }
 
 export default async function handler(req) {
