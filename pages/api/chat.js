@@ -7,6 +7,7 @@ import { rerankCandidates } from "../../lib/rag/reranker.js";
 import { isConfident } from "../../lib/rag/confidence.js";
 import { synthesizeRAGAnswer } from "../../lib/rag/synthesizer.js";
 import { getGeneralAnswer } from "../../lib/rag/fallback.js";
+import { searchGold, formatGoldSources } from "../../lib/rag/searchGold.js";
 
 export const config = { runtime: "edge" };
 
@@ -104,6 +105,72 @@ export default async function handler(req) {
         return okJSON({ rag: { answer: "Hello! How can I help?", sources: [] }, fallback: null, path: "greet" });
       }
     }
+
+    // === GOLDEN ANSWERS LOOKUP ===
+    const USE_GOLD_KB = process.env.USE_GOLD_KB === "true";
+
+    if (USE_GOLD_KB) {
+      try {
+        console.log("[gold] Searching golden answers for:", userQuery);
+        const goldResult = await searchGold(userQuery, { limit: 5 });
+        
+        if (goldResult.best) {
+          console.log(`[gold] Best match: ${goldResult.best.id}, combined=${goldResult.best.combined.toFixed(4)}, classification=${goldResult.classification}`);
+          
+          // HIGH CONFIDENCE: Auto-serve golden answer
+          if (goldResult.classification === "gold") {
+            const formattedSources = formatGoldSources(goldResult.best.sources);
+            return okJSON({
+              rag: {
+                answer: goldResult.best.gold_answer,
+                sources: formattedSources
+              },
+              fallback: null,
+              path: "rag",
+              gold_metadata: {
+                id: goldResult.best.id,
+                question: goldResult.best.question,
+                human_confidence: goldResult.best.human_confidence,
+                combined_score: goldResult.best.combined,
+                verified_by: goldResult.best.verified_by,
+                last_verified: goldResult.best.last_verified,
+                classification: "gold"
+              }
+            });
+          }
+          
+          // BORDERLINE: Serve with disclaimer
+          if (goldResult.classification === "gold_borderline") {
+            const disclaimer = "⚠️ Note: This is a high-confidence match from our curated knowledge base, but pending final verification.\n\n";
+            const formattedSources = formatGoldSources(goldResult.best.sources);
+            return okJSON({
+              rag: {
+                answer: disclaimer + goldResult.best.gold_answer,
+                sources: formattedSources
+              },
+              fallback: null,
+              path: "rag",
+              gold_metadata: {
+                id: goldResult.best.id,
+                question: goldResult.best.question,
+                human_confidence: goldResult.best.human_confidence,
+                combined_score: goldResult.best.combined,
+                classification: "gold_borderline"
+              }
+            });
+          }
+          
+          // LOW SCORE: Continue to RAG
+          console.log(`[gold] Score too low (${goldResult.best.combined.toFixed(4)}), falling through to RAG`);
+        } else {
+          console.log("[gold] No golden answer candidates found, falling through to RAG");
+        }
+      } catch (goldErr) {
+        console.warn("[gold] Golden answer search failed:", goldErr?.message || goldErr);
+        // Continue to RAG on error
+      }
+    }
+    // === END GOLDEN ANSWERS LOOKUP ===
 
     // 1) Router (use conversationHistory)
     let refined_query = userQuery;
