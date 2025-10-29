@@ -50,8 +50,8 @@ openai.api_key = OPENAI_API_KEY
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 VECTOR_DIMENSION = 1536
-CHUNK_SIZE_WORDS = 300
-CHUNK_OVERLAP = 50
+CHUNK_SIZE_WORDS = 400  # Increased from 300 for better context
+CHUNK_OVERLAP = 80      # Increased from 50 for better continuity
 BATCH_SIZE = 100
 MAX_PDF_STORE_MB = 100  # If PDF size >= this, store metadata in documents_large and skip embedding
 MIN_TEXT_WORDS = 20  # skip very small extractions
