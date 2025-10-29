@@ -208,7 +208,23 @@ export default async function handler(req) {
 
     // 8) Success: return RAG result (final.sources or topDocs -> mapped)
     const rag_sources = (final && final.sources && final.sources.length) ? final.sources : topDocs.map((d,i)=>({ id: i+1, title: d.source_title || d.source_file || `source ${i+1}`, url: d.source_url || null, excerpt: d.content && d.content.slice(0,400) }));
-    return okJSON({ rag: { answer: final.answer, sources: rag_sources }, fallback: null, path: "rag" });
+    
+    // Phase 2: Include claims if available
+    const responsePayload = { 
+      rag: { 
+        answer: final.answer, 
+        sources: rag_sources 
+      }, 
+      fallback: null, 
+      path: "rag" 
+    };
+    
+    // Add claims if they were extracted
+    if (final.claims && final.claims.length > 0) {
+      responsePayload.rag.claims = final.claims;
+    }
+    
+    return okJSON(responsePayload);
 
   } catch (err) {
     console.error("chat api error:", err);

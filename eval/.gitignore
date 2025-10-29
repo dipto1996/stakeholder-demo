@@ -1,0 +1,15 @@
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Evaluation outputs (keep in local only)
+model_outputs*.jsonl
+eval_results*.json
+eval_details*.csv
+review*.csv
+
+# OS files
+.DS_Store
+
