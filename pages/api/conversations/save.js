@@ -13,7 +13,7 @@ export default async function handler(req, res) {
 
   try {
     const userId = session.user.id;
-    const body = await req.json().catch(() => null);
+    const body = req.body;
     if (!body || !Array.isArray(body.messages)) {
       return res.status(400).json({ error: "Invalid payload: messages array required" });
     }
